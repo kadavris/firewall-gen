@@ -151,6 +151,7 @@ sub inet_rules
 {
   my $name = $_[0];
   my $settings = $net_interfaces{ $name };
+  my $chain;
 
   my $chain_in = $settings->{ 'chains' }->{ 'in' };
   make_chain( 'INPUT', $chain_in, '************ I-net (' . $name . ')***********' );
@@ -162,10 +163,9 @@ sub inet_rules
 
   # block/reject obvious scans and some malformed stuff. No logging from i-net.
   # split by portranges for statistical purposes
-  my $chain = 'inet_scans';
+  my $scans_chain = 'inet_scans';
 
-  make_chain( $chain_in, $chain );
-    #addto( $chain, '-j LOG --log-level info --log-prefix "ipt4-BlKSCN: "' );
+  make_chain( $chain_in, $scans_chain );
 
     for my $key ( keys %{ $settings->{ 'incoming reject' } } )
     {
@@ -173,13 +173,9 @@ sub inet_rules
 
       for my $ports ( @{ $settings->{ 'incoming reject' }->{ $key } } )
       {
-        addto( $chain, '-p', $proto, '-m multiport --dports', $ports, '-j REJECT --reject-with', $method );
+        addto( $scans_chain, '-p', $proto, '-m multiport --dports', $ports, '-j REJECT --reject-with', $method );
       }
     }
-
-  $chain = 'inet_badtcp';
-  make_chain( $chain_in, $chain );
-  make_bad_tcp_rules( $chain_in, $chain );
 
   for my $n ( drop_destinations() )
   {
@@ -236,7 +232,7 @@ sub inet_rules
           }
           else # open as is
           {
-            addto( $chain_in, $addr, '-p', $proto, '--dport', $port, $proto eq 'tcp' ? '-m conntrack --ctstate NEW' : ''  );
+            addto( $chain_in, $addr, '-p', $proto, '--dport', $port, $proto eq 'tcp' ? '-m conntrack --ctstate NEW' : '', '-j ACCEPT'  );
           }
         } # portlist
       } # addr:port
@@ -254,10 +250,14 @@ sub inet_rules
   #addto( $chain_in, '-m set --match-set droplist_by_port src -j DROP' );
   #addto( $chain_in, '-m set --match-set droplist_by_ip src   -j DROP' );
 
-  addto( $chain_in, '-j', 'inet_bad_tcp_pkt' );
+  # here, after per-port loggers
+  my $bad_tcp_chain = 'inet_badtcp';
+  make_chain( $chain_in, $bad_tcp_chain );
+  make_bad_tcp_rules( $chain_in, $bad_tcp_chain );
+  addto( $chain_in, '-j', $bad_tcp_chain );
 
-  addto( $chain_in, '-p tcp --tcp-flags SYN,ACK,FIN,RST RST -g inet_block_scan' );
-  addto( $chain_in, '-p udp -g inet_block_scan' );
+  addto( $chain_in, '-p tcp --tcp-flags SYN,ACK,FIN,RST RST -j', $scans_chain );
+  addto( $chain_in, '-p udp -j', $scans_chain );
 
   addto( $chain_in, '-j DROP' ); # all other to hell. Better leave it here to close most insecure hole
 
