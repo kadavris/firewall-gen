@@ -1,0 +1,77 @@
+#!/bin/perl
+# this script scans sendmail's maillog for anti-spam agent's markers
+# and puts offender IP into selected ipset table for fast blocking by firewall
+# Made by Andrej Pakhutin (pakhutn@gmail.com)
+use strict;
+use warnings;
+use lib '.';
+
+require 'lib_ipset_ip_port.inc';
+
+my $spam_mark = 'spam off!';
+my $output_list = 'droplist_by_port';
+my $port = 25;
+
+my $spamoff = 0; #id marker if last line was "spam off!"
+
+my $lastid = '';
+
+my $rejects_count = 0;
+my $spam_count = 0;
+
+my ( $id, $ip, %hosts );
+
+while( </var/log/maillog*> )
+{
+  my $log_file = $_;
+  open F, $log_file or die "open: $log_file: $!";
+
+  while(<F>)
+  {
+    /lost input/ and next; # to prevent spam marker to clear
+
+    /sendmail\[\d+\]: ([^:]+)/ or next;
+    $id = $1;
+
+    if ( $spamoff == 1 and $id eq $lastid and /from=/ )
+    {
+        /\[(\d+.\d+.\d+.\d+)\]/;
+        $ip = $1;
+    }
+    if (/reject=/)
+    {
+        /\[(\d+.\d+.\d+.\d+)\]/;
+        $ip = $1;
+        ++$rejects_count;
+    }
+    elsif ( /$spam_mark/ )
+    {
+        $spamoff = 1;
+        ++$spam_count;
+        next;
+    }
+    else
+    {
+        next;
+    }
+
+    $spamoff = 0;
+    $lastid = $id;
+
+    if ( defined( $hosts{ $ip } ) )
+    {
+      ++$hosts{ $ip };
+    }
+    else
+    {
+      $hosts{ $ip } = 1;
+    }
+  }
+
+  close F;
+}
+
+print "Rejects: $rejects_count, spams: $spam_count\n";
+
+update_ipset_list( $output_list, $port );
+

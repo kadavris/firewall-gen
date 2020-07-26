@@ -1,0 +1,347 @@
+# configuration for IPv4 iptables firewall generator script
+# This is perl code that will be included directly into generator.
+# So be paranoid
+
+%tables = (
+  'filter' => {
+     # OK, basic scheme for filter is
+     # 1) from INPUT -> jump to XXX_in chain for each interface
+     # 2) check for common problems
+     # 3) if there are %access entries defined: match MAC to IP, goto #4. if NO - goto #?
+     # 4) in separate chain check class profile and ACCEPT or DROP.
+     # 5) ACCEPT or DROP as defined within default class
+
+    'common chains' => {
+      'host prefix' => '_h_', # will be like wifiXXXsomehost
+      'mismatched mac' => '_mism_mac', # reports that mac is known, but IP is not a match
+      'mismatched ip'  => '_mism_ip',  # reports that IP is known, but MAC is not on access list
+    },
+
+    'defaults' => {
+       'INPUT'   => 'ACCEPT', # for hassio to work
+       'OUTPUT'  => 'ACCEPT',
+       'FORWARD' => 'DROP',
+    }, # filter defaults
+  }, # filter
+
+  'nat' => {
+    'defaults' => {
+       'INPUT'   => 'ACCEPT',
+       'OUTPUT'  => 'ACCEPT',
+       'PREROUTING' => 'ACCEPT',
+       'POSTROUTING' => 'ACCEPT',
+    }, # nat defaults
+  }, # nat
+);
+
+# -------------------------------------------------------------------------
+# Classes:
+#    This stuff sets common access parameters for hosts/nets or interfaces.
+#    'class name' => [ 'parent class or empty', 'option1', ..., 'optionN' ],
+#
+#    options format:
+#       (allow|deny)to:addr[:proto:portlist[;...]] - used with quarantine to enable/disable some additional stuff
+#       bootp - add bootstrap ports (implies dhcp)
+#       dhcp|rtsp - enable specifics for this to work
+#       (drop|log) bad tcp - adds rules to check for common malformed tcp packets used in hacks and scans
+#       i-net[:dst1,dst2...] - allows outgoing connections to internet hosts/nets
+#       limit scans - limit icmp pings and tcp probes to advised level
+#       logdrop[:portlist] - for close monitored nets - log all packet drops. default portlist is 0-1023
+#       norestrict - no particular filtering except general rules in the generator script.
+#       quarantine[addr:proto:portlist;...] - close all/some OUTGOING ON THIS INTERFACE until it is an established session (except what's in i-net)
+#
+#       proto:portlist
+#           - when standalone - allow _incoming_to_server's_matching_ip_ by protocol & port(s).
+#           - whein used as a modifier for some other stuff like quarantine - set what block
+#           proto: all|any|bcast|icmp|tcp|udp
+#           portlist: +|-|*|portlist[,...]
+#           where: '+' - allow all, '-' = block all, '*' - relaxed access to _server_ iface
+#                  portlist  - portrange[,portrange...]
+#                  portrange - port[-port]
+#           multiple, entries for a single protocol are allowed.
+#           when there is '!' used before the port, the inverse meaning is applied (unimplemented!)
+
+%classes = (
+  'net un-trusted' => [ '', 'tcp:-', 'udp:-', 'icmp:-' ], # base class: no-nothing
+  'net contained'  => [ '', 'tcp:*', 'udp:*', 'icmp:*' ], # net hosts can do whatever they want, but inside this net only. for containers
+  'net docker'     => [ 'net contained', 'i-net' ], #  allow them virtuals to go out
+  'net hassio'     => [ 'net docker', ],
+  'net trusted'    => [ '', 'norestrict' ], # implies i-net and forwarding EVERYWHERE. be careful!
+  #
+  'host un-trusted' => [ '', 'tcp:-', 'udp:-', 'icmp:-' ], # base class: no-nothing
+  #
+  'wifi restricted'    => [ 'net un-trusted' ],
+  'wifi net'           => [ 'net un-trusted',  'i-net', 'dhcp', 'tcp:domain', 'udp:domain,time,ntp', 'logdrop', 'log bad tcp', 'limit scans' ],
+  'wifi host'          => [ 'host un-trusted', 'i-net', 'dhcp', 'tcp:domain', 'udp:domain,time,ntp' ],
+  #
+  'wifi cam'           => [ 'wifi host', 'rtsp' ],
+  'wifi guest'         => [ 'wifi host' ],
+  'wifi known gadget'  => [ 'wifi host', 'tcp:http,https,ssh' ],
+  'wifi known pc'      => [ '', 'norestrict' ],
+  'wifi smarthome'     => [ 'wifi host' ],
+  'wifi smarthome hub' => [ 'wifi smarthome' ],
+  'smart hub'          => [ 'wifi smarthome', 'bcast:5123' ],
+  #
+  'sec default'    => [ '', 'logdrop', 'dhcp', 'udp:time,ntp', 'drop bad tcp', 'limit scans' ],
+  'sec restricted' => [ 'net un-trusted', 'logdrop' ],
+  #
+  'sec cam'        => [ 'sec default', 'rtsp' ],
+  'sec hub'        => [ 'sec default', 'i-net' ],
+  'sec mon vendor1'=> [ 'sec hub', 'tcp:20000', 'tcp:30000' ],
+  #
+  'net switch' => [ '', 'dhcp', 'udp:time,ntp' ],
+  #
+  # interfaces: NOTE: don't use this for net/hosts
+  #
+  'iface default'      => [ '' ],
+  'iface trusted'      => [ '', 'norestrict' ],
+  'iface quarantined'  => [ '', 'quarantine', 'logdrop' ],
+  'iface untrusted w i-net' => [ 'iface quarantined', 'i-net' ], # any otherwise quarantined container that may go for internet
+  #
+  'iface docker' => [ 'iface untrusted w i-net', 'tcp:domain', 'udp:domain,time,ntp' ],
+  'iface hassio' => [ 'iface docker', 'allowto:smarthub', 'allowto:10.1.2.0/24', 'allowto:192.168.1.0/24', 'allowto:10.1.1.1:*:mqtt' ],
+);
+
+# -------------------------------------------------------------------------
+# Interfaces/nets:
+# Current scheme uses 2 hardcoded names:
+#    inet - internet
+#    lan  - local/secure network
+
+# the init() proc will run "ip a" to append/check actual interface data to each of the root keys.
+# e.g. the $lan hash will be like:
+#     if = 'enp0s31f6'
+#     default = 0     -- is this a default route?
+#     gw = 'x.x.x.x'  -- if this if is default then this is gateway's IP
+#     type = 'ether'
+#     up = 1    -- interface is up?
+#     ipX addr[]  = '10.1.1.1'    -- IPs
+#     ipX bcast[] = '10.1.1.255'  -- broadcasts
+#     ipX mask[]  = 24            -- masks
+#     ipX net[]   = '10.1.1.0/24' -- networks
+#     ipX default class - default for unlisted network clients to access this interface
+#     ipX interface class - interface's own class. Used mainly for outgoing-quarantined virtual containers, etc...
+
+# 'access' sub-tree format:
+#    'host/ip' => [ 'mac', 'allowed tcp ports list', 'allowed udp ports list', 'allowed icmp ports list' ]
+#    '+' in ports list means no restrictions to any internal address, '*' - relaxed only to server's if, '-'|'' - drop all
+
+%net_interfaces = ( # root keys: lan,inet,wifi,sec - are hardcoded names!
+  'lan' => {
+      'mac' => 'xx:xx:xx:xx:xx:xx', # server-side
+      'chains'       => { 'in' => 'lan_in', 'out' => '' },  # main chain name in iptables
+      'ip4 addr'     => [ '10.1.1.1',    '10.90.90.9'   ],  # 'ip4 *' - all array must be fiiled
+      'ip4 bcast'    => [ '10.1.1.255',  '10.90.90.255' ],
+      'ip4 mask'     => [ 24,            24 ],
+      'ip4 net'      => [ '10.1.1.0/24', '10.90.90.0/24' ],
+      'ip4 default class'   => [ 'net trusted', 'net un-trusted' ],
+      'ip4 interface class' => [ 'iface trusted', 'iface trusted' ],
+      'access' => {
+           'hosts' => {
+               'dlink-switch' => [ 'xx:xx:xx:xx:xx:xx', 'net switch' ],
+           },
+      },
+  },
+
+  # -------------------------------------
+  'inet' => {
+      'mac' => 'xx:xx:xx:xx:xx:xx', # MAC here is still a formality
+      'chains'       => { 'in' => 'inet_in', 'out' => '' }, # chains names
+      'ip4 addr'     => [ 'your inet ip' ],
+      'ip4 bcast'    => [ 'X.Y.Z.255' ],  # this and below is redundant, but used to cross-check with "ip a" for obvious errors
+      'ip4 mask'     => [ 24 ],
+      'ip4 net'      => [ 'x.y.z.0/24' ],
+
+      'incoming reject' => { # REJECT these.
+         # Format of keys: 'proto:method', where proto is tcp,udp. method is --reject-with argument
+         # The logic behind overlapping ranges is that you may want to see attempts statistics for some separate ports
+
+        'tcp:tcp-reset' => [
+           'ftp,ftp-data', 'ssh,telnet', 'smtp,urd,pop3,imap,imap3,imaps,pop3s',
+           'domain,domain-s', 'http,https', '137:139', 'rtsp',
+           '0:1023'
+        ],
+
+        'udp:icmp-port-unreachable' => [
+           'domain,domain-s',
+           '0:1023',
+           '0:65535'
+        ]
+      },
+
+      # for incoming* stuff the list is in [addr:]port[,port...] format
+      'incoming open'      => { # ports to freely open for incoming
+         'tcp' => [ 'someport', '12345' ],
+         'udp' => [  ]
+      },
+      'incoming open & log'  => { # ports to open AND LOG (tcp is setup only)
+         'tcp' => [ 'X.X.X.X:23', 'Y.Y.Y.0/24:23' ],
+         'udp' => [] # allow SSH from some
+      },
+      'incoming block & log' => { # _closed_ ports to LOG on attempt
+         'tcp' => [], 'udp' => []
+      },
+
+      'silent drop list' => [ # this is dst ips:ports that we drop silently from the START.
+         # NOTE: @cross_drop_list with both -s and -d added here automatically
+         '*:137',
+         '*:138',
+         '*:1900',
+         '*:1997',
+         '*:3702',
+         '*:7680',
+         '*:8083'
+      ], # silent drop
+  },
+
+  # -------------------------------------
+  # A cable to access point. insecure by design
+  # keep key names short - it is used as parts of rule names
+  'wifi' => {
+      'mac' => 'xx:xx:xx:xx:xx:xx', # interface MAC
+      'name' => 'Wi-Fi', # name to display
+      'chains' => { 'in' => 'wifi_in', 'out' => '' },
+
+      # for ip4* multiple addresses supported
+      'ip4 addr'            => [ '192.168.0.2',          '192.168.1.2',     '192.168.2.2'   ],
+      'ip4 bcast'           => [ '192.168.255.255',      '192.168.255.255', '192.168.255.255' ],
+      'ip4 mask'            => [ 16,                     16,                16 ],
+      'ip4 net'             => [ '192.168.0.0/16',       '192.168.0.0/16',  '192.168.0.0/16' ],
+      # 
+      'ip4 default class'   => [ 'wifi net',             'wifi restricted', 'wifi restricted' ],
+      'ip4 interface class' => [ 'iface trusted',        'iface trusted',   'iface trusted' ],
+
+      'silent drop list' => [ # this is stuff that we drop at the END and silently.
+         '224.0.0.0/4', # 224.0.0.0 ~ 239.255.255.255 reserved for multicast addresses. RFC 3171
+         '240.0.0.0/4', # reserved (former Class E network) RFC 1700
+         '255.255.255.255', # is the limited broadcast address (limited to all other nodes on the LAN) RFC 919
+         '*:1900',
+         '*:1997',
+         '*:5555',
+         '*:3702',
+         '*:7680',
+         '*:8083'
+      ], # silent drop
+
+      'access' => {
+         'hosts' => {
+           'server-to-wifi' =>  [ 'xx:xx:xx:xx:xx:xx', 'iface trusted' ], # own intf
+           'somephone' =>       [ 'xx:xx:xx:xx:xx:xx', 'wifi known gadget' ],
+           'some-tablet' =>     [ 'xx:xx:xx:xx:xx:xx', 'wifi known gadget' ],
+           'some-notebook' =>   [ 'xx:xx:xx:xx:xx:xx', 'wifi known pc' ],
+           'vacuum' =>          [ 'xx:xx:xx:xx:xx:xx', 'wifi smarthome' ],
+           'wifi-router' =>     [ 'xx:xx:xx:xx:xx:xx', 'net switch' ], # Access point itself
+           'smartcam1' =>       [ 'xx:xx:xx:xx:xx:xx', 'wifi cam' ],
+           'smarthub' =>        [ 'xx:xx:xx:xx:xx:xx', 'wifi smarthome hub' ],
+           'smartplug1' =>      [ 'xx:xx:xx:xx:xx:xx', 'wifi smarthome' ],
+       }, #access/hosts
+    },
+  }, # wifi
+
+  # -------------------------------------
+  # another ethernet for security/surveillance stuff. insecure too (chinese cameras seeking master's commands, ye know)
+  'sec'  => {
+      'mac' => 'xx:xx:xx:xx:xx:xx',
+      'name' => 'Security',
+      'chains'       => { 'in' => 'sec_in', 'out' => '' },
+      'ip4 addr'     => [ '10.1.2.1', ],
+      'ip4 bcast'    => [ '10.1.2.255' ],
+      'ip4 mask'     => [ 24 ],
+      'ip4 net'      => [ '10.1.2.0/24' ],
+      'ip4 restrict' => [ 0 ],
+      'ip4 default class' => [ 'sec default' ],
+      'ip4 interface class' => [ 'iface trusted' ],
+
+      'access' => {
+           'hosts' => {
+              'ip-cam-1'    => [ 'xx:xx:xx:xx:xx:xx', 'sec cam' ],
+              'ip-cam-2'    => [ 'xx:xx:xx:xx:xx:xx', 'sec cam' ],
+              'sec mon hub' => [ 'xx:xx:xx:xx:xx:xx', 'sec mon vendor' ],
+           }, #access/hosts
+      },
+
+      'silent drop list' => [ # this is stuff that we drop at the START and silently.
+         '*:53', # DNS is unnecessary here
+         '*:80', # some upnp-like stuff happens
+      ], # silent drop
+  }, # sec
+
+  # -------------------------------------
+  'hassio' => { # Home Assistant in container
+      'mac' => '', # no MAC means virtual
+      'chains'       => { 'in' => 'hassio_in', 'out' => 'hassio_out' },
+      'rules func'   => \&virtual_rules, # dirty hack to implement different approach for specific networks
+      'ip4 addr'     => [ '172.30.32.1' ],
+      'ip4 bcast'    => [ '172.30.33.255' ],
+      'ip4 mask'     => [ 23, ],
+      'ip4 net'      => [ '172.30.32.0/23' ],
+      'ip4 default class'   => [ 'net hassio' ],
+      'ip4 interface class' => [ 'iface hassio' ],
+
+      'silent drop list' => [ # this is stuff that we drop at the END and silently.
+        # empty
+      ], # silent drop
+
+      'access' => {
+         'hosts' => {
+           # empty
+         }
+      }, #access/hosts
+  }, # hassio
+
+
+  # -------------------------------------
+  #7: docker0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP group default
+  #  link/ether 02:42:b2:60:b0:e8 brd ff:ff:ff:ff:ff:ff
+  #  inet 172.17.0.1/16 scope global docker0
+  #     valid_lft forever preferred_lft forever
+  'docker0' => { # docker's own interface
+      'mac' => '', # no MAC means virtual.
+      'name' => 'docker',
+      'chains'       => { 'in' => 'docker0_in', 'out' => 'docker0_out' },
+      'rules func'   => \&virtual_rules,
+      'ip4 addr'     => [ '172.17.0.1' ],
+      'ip4 bcast'    => [ '172.17.255.255' ],
+      'ip4 mask'     => [ 16, ],
+      'ip4 net'      => [ '172.17.0.0/16' ],
+      'ip4 restrict' => [ 0 ],
+      'ip4 default class'   => [ 'net docker' ],
+      'ip4 interface class' => [ 'iface docker' ],
+
+      'silent drop list' => [ # this is stuff that we drop at the END and silently.
+           # empty
+      ], # silent drop
+
+      'access' => {
+         'hosts' => {
+           # empty
+         }
+      }, #access/hosts
+  }, # docker0
+);
+
+# this is the list of nets which are by default will be DROPped on access from other nets
+# hard anti-spoof feature.
+# used in sub drop_destinations() that somewhat smartly allow internal traffic to flow still
+@cross_drop_list = ( # wiki: https://en.wikipedia.org/wiki/Reserved_IP_addresses
+  '0.0.0.0/8',           # 0.0.0.0–0.255.255.255       Software    Current network[1] (only valid as source address).
+  '10.0.0.0/8',          # 10.0.0.0–10.255.255.255     Private network     Used for local communications within a private network.[2]
+  '100.64.0.0/10',       # 100.64.0.0–100.127.255.255  Private network     Shared address space[3] for communications between a service provider and its subscribers when using a carrier-grade NAT.
+  '127.0.0.0/8',         # 127.0.0.0–127.255.255.255   Host    Used for loopback addresses to the local host.[1]
+  '169.254.0.0/16',      # 169.254.0.0–169.254.255.255 Subnet  Used for link-local addresses[4] between two hosts on a single link when no IP address is otherwise specified, such as would have normally been retrieved from a DHCP server.
+  '172.16.0.0/12',       # 172.16.0.0–172.31.255.255   Private network     Used for local communications within a private network.[2]
+  '192.0.0.0/24',        # 192.0.0.0–192.0.0.255       Private network     IETF Protocol Assignments.[1]
+  '192.0.2.0/24',        # 192.0.2.0–192.0.2.255       Documentation   Assigned as TEST-NET-1, documentation and examples.[5]
+  '192.88.99.0/24',      # 192.88.99.0–192.88.99.255   Internet    Reserved.[6] Formerly used for IPv6 to IPv4 relay[7] (included IPv6 address block 2002::/16).
+  '192.168.0.0/16',      # 192.168.0.0–192.168.255.255 Private network     Used for local communications within a private network.[2]
+  '198.18.0.0/15',       # 198.18.0.0–198.19.255.255   Private network     Used for benchmark testing of inter-network communications between two separate subnets.[8]
+  '198.51.100.0/24',     # 198.51.100.0–198.51.100.255 Documentation   Assigned as TEST-NET-2, documentation and examples.[5]
+  '203.0.113.0/24',      # 203.0.113.0–203.0.113.255   Documentation   Assigned as TEST-NET-3, documentation and examples.[5]
+  '224.0.0.0/4',         # 224.0.0.0–239.255.255.255   Internet    In use for IP multicast.[9] (Former Class D network).
+  '240.0.0.0/4',         # 240.0.0.0–255.255.255.254   Internet    Reserved for future use.[10] (Former Class E network).
+  #'255.255.255.255/32',  # 255.255.255.255            Subnet  Reserved for the "limited broadcast" destination address.[1][11]
+);
+
+
+#$save_file = '/etc/sysconfig/iptables.fwgen';
+$save_file = 'iptables4-gen.test_output';
