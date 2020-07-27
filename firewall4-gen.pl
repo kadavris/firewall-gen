@@ -5,7 +5,8 @@
 use strict;
 use warnings;
 use Carp;
-use Storable qw(dclone);
+use Getopt::Long;
+use Storable qw(dclone); # deep clone used to init access class with parent's data
 
 my %net_interfaces; #main interfaces config
 my $save_file; # rules output file
@@ -15,10 +16,30 @@ my @cross_drop_list; # default destinations to drop between interfaces
 my %tables; # tables config
 my %classes; # access rules
 
+my $debug = 0;
+my $verboseness = 1; # at zero show minimal info needed to confirm what's done
+
 my $errors_count;   # will not load new config if any
 my $warnings_count; # da same
 
 my $cfg = 'firewall4-gen.conf';
+
+GetOptions(
+  'd=i' => \$debug,
+  'v=i' => \$verboseness,
+);
+
+if( $#ARGV > -1 )
+{
+  if( ! -r $ARGV[0] )
+  {
+    print "$ARGV[0] is unreadable. Supply non-default config name as a parameter\n";
+    exit(1);
+  }
+
+  $cfg = $ARGV[0];
+}
+
 open C, $cfg  or die "$cfg: $!";
 sysread( C, $cfg, 999999 ) or die "config is empty?";
 eval $cfg or croak "config: $@";
@@ -49,7 +70,7 @@ my %chains; # used to sanity-check rule output and creation fmt: tablename:chain
 init(); # pre-fill some names and addresses for simpler configuration
 
 # make shortcuts
-my $lan  = $net_interfaces{ 'lan'  };
+my $lan  = $net_interfaces{ 'lan'  }; # This interface is assumed to be most secure and trusted.
 my $inet = $net_interfaces{ 'inet' }; # default
 
 my $out_file;
@@ -79,7 +100,7 @@ addto( 'OUTPUT', '-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' );
 inet_rules( 'inet' );
 lan_rules();
 
-for my $ifkey ( keys %net_interfaces ) # construct virtual interfaces rules
+for my $ifkey ( sort( keys %net_interfaces ) ) # construct virtual interfaces rules. make it diff-friendly
 {
   if ( $ifkey eq 'inet' || $ifkey eq 'lan' )
   {
@@ -90,12 +111,12 @@ for my $ifkey ( keys %net_interfaces ) # construct virtual interfaces rules
 
   if ( $if->{ 'mac' } ne '' )
   {
-    print "+ Adding generic physical: ", $if->{ 'alias' }, '/', $if->{ 'name' },"\n";
+    print "+ Adding generic physical: ", $if->{ 'alias' }, '/', $if->{ 'if name' },"\n";
     generic_physical_rules( $ifkey, $if );
   }
   else
   {
-    print "+ Adding virtual: ", $if->{ 'alias' }, '/', $if->{ 'name' }, "\n";
+    print "+ Adding virtual: ", $if->{ 'alias' }, '/', $if->{ 'if name' }, "\n";
     $if->{ 'rules func' }->( $if );
   }
 }
@@ -146,20 +167,20 @@ close $out_file;
 ###############################################################################
 ###############################################################################
 # block chain is interfering somehow with new and legitimate outgoing connections setup, so put it after conntrack ESTAB
-# in: name of settings. used for miultiple inet interfaces
+# in: name of the key in settings. used for multiple inet interfaces
 sub inet_rules
 {
-  my $name = $_[0];
-  my $settings = $net_interfaces{ $name };
+  my $key_name = $_[0];
+  my $if = $net_interfaces{ $key_name };
   my $chain;
 
-  my $chain_in = $settings->{ 'chains' }->{ 'in' };
-  make_chain( 'INPUT', $chain_in, '************ I-net (' . $name . ')***********' );
+  my $chain_in = $if->{ 'chains' }->{ 'in' };
+  make_chain( 'INPUT', $chain_in, '************ I-net (' . $key_name . ')***********' );
 
-  make_log_chains( $name, 'b' );
+  make_log_chains( $key_name, 'b' );
 
-  my $ip  = $settings->{ 'ip4 addr' }->[0];
-  my $net = $settings->{ 'ip4 net' }->[0];
+  my $ip  = $if->{ 'ip4 addr' }->[0];
+  my $net = $if->{ 'ip4 net' }->[0];
 
   # block/reject obvious scans and some malformed stuff. No logging from i-net.
   # split by portranges for statistical purposes
@@ -167,11 +188,11 @@ sub inet_rules
 
   make_chain( $chain_in, $scans_chain );
 
-    for my $key ( keys %{ $settings->{ 'incoming reject' } } )
+    for my $key ( keys %{ $if->{ 'incoming reject' } } )
     {
       my ( $proto, $method ) = split( ':', $key );
 
-      for my $ports ( @{ $settings->{ 'incoming reject' }->{ $key } } )
+      for my $ports ( @{ $if->{ 'incoming reject' }->{ $key } } )
       {
         addto( $scans_chain, '-p', $proto, '-m multiport --dports', $ports, '-j REJECT --reject-with', $method );
       }
@@ -186,7 +207,7 @@ sub inet_rules
   $chain = 'inet_silent_drop';
   make_chain( $chain_in, $chain );
 
-  for my $n ( @{ $settings->{ 'silent drop list' } } )
+  for my $n ( @{ $if->{ 'silent drop list' } } )
   {
     add_hostport_to( $chain, '-d', $n, '-j DROP' );
   }
@@ -201,7 +222,7 @@ sub inet_rules
   {
     for my $proto ( qw~tcp udp~ )
     {
-      my $list = $settings->{ $category }->{ $proto };
+      my $list = $if->{ $category }->{ $proto };
       next if $#$list == -1; # no specifics
 
       for my $hp ( @$list )
@@ -224,11 +245,11 @@ sub inet_rules
         {
           if ( $category eq 'incoming log' ) # log and ACCEPT
           {
-            addto( $chain_in, $addr, '-p', $proto, '--dport', $port, $proto eq 'tcp' ? '-m conntrack --ctstate NEW' : '', '-j', $settings->{ 'oklog chains' }->{ 'in' } );
+            addto( $chain_in, $addr, '-p', $proto, '--dport', $port, $proto eq 'tcp' ? '-m conntrack --ctstate NEW' : '', '-j', $if->{ 'oklog chains' }->{ 'in' } );
           }
           elsif ( $category eq 'incoming note' ) # LOG and DROP
           {
-            addto( $chain_in, $addr, '-p', $proto, '--dport', $port, '-j', $settings->{ 'droplog chains' }->{ 'in' } );
+            addto( $chain_in, $addr, '-p', $proto, '--dport', $port, '-j', $if->{ 'droplog chains' }->{ 'in' } );
           }
           else # open as is
           {
@@ -261,13 +282,13 @@ sub inet_rules
 
   addto( $chain_in, '-j DROP' ); # all other to hell. Better leave it here to close most insecure hole
 
-  addto( 'INPUT', '-i', $settings->{ 'name' }, '-j', $chain_in );
+  addto( 'INPUT', '-i', $if->{ 'if name' }, '-j', $chain_in );
 
   # cutting runaway specials:
   for my $a ( @cross_drop_list )
   {
-    addto( 'OUTPUT', '-o', $settings->{ 'name' }, '-s', $a, '-j DROP' );
-    addto( 'OUTPUT', '-o', $settings->{ 'name' }, '-d', $a, '-j DROP' );
+    addto( 'OUTPUT', '-o', $if->{ 'if name' }, '-s', $a, '-j DROP' );
+    addto( 'OUTPUT', '-o', $if->{ 'if name' }, '-d', $a, '-j DROP' );
   }
 } # inet_rules()
 
@@ -280,7 +301,7 @@ sub generic_physical_rules
   my ( $ip, $net ) = ( $if->{ 'ip4 addr' }->[0], $if->{ 'ip4 net' }->[0] );
 
   my $chain_in = $if->{ 'chains' }->{ 'in' };
-  make_chain( 'INPUT', $chain_in, '************ ' . $if->{ 'name' } . ' ***********' );
+  make_chain( 'INPUT', $chain_in, '************ ' . $if->{ 'if name' } . ' ***********' );
 
   make_log_chains( $ifkey, 'b' );
 
@@ -302,10 +323,11 @@ sub generic_physical_rules
 
   addto( $chain_in, '-j', $if->{ 'droplog chains' }->{ 'in' } ); # we want to see what's going on there
 
-  addto( 'INPUT', '-i', $if->{ 'name' }, '-j', $chain_in );
+  addto( 'INPUT', '-i', $if->{ 'if name' }, '-j', $chain_in );
 }
 
 ###############################################################################
+# This interface is assumed to be most secure and trusted.
 sub lan_rules
 {
   my $chain_in = $lan->{ 'chains' }->{ 'in' };
@@ -317,9 +339,9 @@ sub lan_rules
 
   add_access_rules( $lan );
 
-  addto( 'INPUT', '-i', $lan->{ 'name' }, '-j', $chain_in );
-  #addto( 'OUTPUT', '-o', $lan->{ 'name' }, '-j ACCEPT' );
-  #addto( 'FORWARD', '-o', $lan->{ 'name' }, '-j ACCEPT' );
+  addto( 'INPUT', '-i', $lan->{ 'if name' }, '-j', $chain_in );
+  #addto( 'OUTPUT', '-o', $lan->{ 'if name' }, '-j ACCEPT' );
+  #addto( 'FORWARD', '-o', $lan->{ 'if name' }, '-j ACCEPT' );
 }
 
 ###############################################################################
@@ -369,12 +391,12 @@ sub virtual_rules
   # finalizing
   if ( $chain_in ne '' )
   {
-    addto( 'INPUT', '-i', $if->{ 'name' }, '-j', $chain_in );
+    addto( 'INPUT', '-i', $if->{ 'if name' }, '-j', $chain_in );
   }
 
   if ( $chain_out ne '' )
   {
-    addto( 'OUTPUT', '-o', $if->{ 'name' }, '-j', $chain_out );
+    addto( 'OUTPUT', '-o', $if->{ 'if name' }, '-j', $chain_out );
   }
 }
 
@@ -850,7 +872,7 @@ sub add_proto_ports_rules
         if ( $port_set->[0] eq '+' ) # no restrictions on i-face + internal forward.
         {
           addto( $chain, $from_to, '-p', $proto, '-j ACCEPT' );
-          addto( 'FORWARD', '-i', $if->{ 'name' }, '-s', $addr, '-p', $proto, '-j ACCEPT' );
+          addto( 'FORWARD', '-i', $if->{ 'if name' }, '-s', $addr, '-p', $proto, '-j ACCEPT' );
         }
         elsif ( $port_set->[0] eq '*' ) # in: relaxed access to our iface. out: net scope only
         {
@@ -954,20 +976,20 @@ sub add_ruleset
     $addr eq '' and croak "chain $chain: 'i-net' needs an address!";
     my $mode = $rules->{ 'i-net' }; # (c)lient/(s)erver/(b)oth
 
-    addto( 'nat:POSTROUTING', '-o', $inet->{ 'name' }, '-s', $addr, '-j SNAT --to-source', $inet->{ 'ip4 addr' }->[0] );
+    addto( 'nat:POSTROUTING', '-o', $inet->{ 'if name' }, '-s', $addr, '-j SNAT --to-source', $inet->{ 'ip4 addr' }->[0] );
 
     if ( ! exists $rules->{ 'norestrict' } ) # don't duplicate
     {
-      addto( $chain, $src, '-o', $inet->{ 'name' }, '-j ACCEPT' );
-      addto( 'FORWARD', '-i', $if->{ 'name' }, '-s', $addr, '-o', $inet->{ 'name' }, '-j ACCEPT' );
+      addto( $chain, $src, '-o', $inet->{ 'if name' }, '-j ACCEPT' );
+      addto( 'FORWARD', '-i', $if->{ 'if name' }, '-s', $addr, '-o', $inet->{ 'if name' }, '-j ACCEPT' );
     }
   } # i-net
 
   if ( exists $rules->{ 'norestrict' } )
   {
-    addto( $chain, '-o', $if->{ 'name' }, '-s', $addr, '-m conntrack --ctstate NEW -j ACCEPT' );
+    addto( $chain, '-o', $if->{ 'if name' }, '-s', $addr, '-m conntrack --ctstate NEW -j ACCEPT' );
     addto( $chain, $src, '-j ACCEPT' );
-    addto( 'FORWARD', '-i', $if->{ 'name' }, '-s', $addr, '-j ACCEPT' );
+    addto( 'FORWARD', '-i', $if->{ 'if name' }, '-s', $addr, '-j ACCEPT' );
     return; # nothing more to do ;)
   }
 
@@ -1092,7 +1114,7 @@ sub add_access_rules
       addto( $mism_ip_chain, '-j LOG --log-level info --log-prefix', '"ipt4-' . $ifalias . ' MAC-,IP+" ' );
       addto( $mism_ip_chain, '-j DROP' );
 
-    for my $host ( keys %{ $host_list } ) # adding individual host's rules
+    for my $host ( sort( keys %{ $host_list } ) ) # adding individual host's rules. make it diff-friendly
     {
       gethostbyname $host or croak "!!! Host doesn't resolve: '$host' !!!";
 
@@ -1301,7 +1323,7 @@ sub log_it
 #     kind can be b=both(default), d=drop only and o=OK only
 sub make_log_chains
 {
-  my ($name, $kind) = @_;
+  my ( $name, $kind ) = @_;
   defined( $kind ) or $kind = 'b';
 
   my ( $parents, $prefix );
@@ -1590,8 +1612,8 @@ sub scan_if
         print "+ $ni -> $if_real_name\n";
 
         $if->{ 'alias' } = $ni; # for reverse ref
-        $if->{ 'type' } = $type;
-        $if->{ 'name' } = $if_real_name;
+        $if->{ 'if type' } = $type;
+        $if->{ 'if name' } = $if_real_name;
         $if->{ 'attr' } = $if_attr;
         $if->{ 'up' } = ( $if_attr =~ /\b(UP)\b/ ) ? 1 : 0;
         $if->{ 'default' } = 0;
@@ -1619,7 +1641,7 @@ sub scan_if
 
       if ( ! defined( $if ) )
       {
-        print "\n??? There is not configured interface with IP4 assigned: $if_real_name\n\n";
+        print "\n??? There is no configured interface with IP4 assigned: $if_real_name\n\n";
         next;
       }
 
@@ -1648,6 +1670,33 @@ sub scan_if
 
   close I;
 
+  # now checking if there are unavailable interfaces in our config
+  my $missed = 0;
+  for my $ni ( keys %net_interfaces )
+  {
+    next if exists( $net_interfaces{ $ni }->{ 'alias' } );
+
+    if ( exists( $net_interfaces{ $ni }->{ 'options' } ) && exists( $net_interfaces{ $ni }->{ 'options' }->{ 'volatile' } ) )
+    {
+      print "!!! Volatile interface is not active now: $ni\n";
+      # filling by the heart then
+      $if = $net_interfaces{ $ni };
+      $if->{ 'alias' } = $ni; # for reverse ref
+      $if->{ 'if type' } = 'virtual';
+      $if->{ 'if name' } = $ni;
+      $if->{ 'attr' } = '';
+      $if->{ 'up' } = 0;
+      $if->{ 'default' } = 0;
+    }
+    else
+    {
+      ++$missed;
+      print "!!! No such interface: $ni\n";
+    }
+  }
+
+  exit(1) if $missed;
+
   # get routing default
   #default via 192.168.1.1 dev wlp0s29u1u7
   open I, '/sbin/ip ro | ' or croak "ip ro: $!";
@@ -1661,9 +1710,9 @@ sub scan_if
 
     for my $ni ( keys %net_interfaces )
     {
-      next if $dev ne lc( $net_interfaces{ $ni }->{ 'name' } );
+      next if $dev ne lc( $net_interfaces{ $ni }->{ 'if name' } );
 
-      $net_interfaces{ $ni }->{ 'alias' } ne 'inet' and croak "!!! default is not through inet interface !!!";
+      $net_interfaces{ $ni }->{ 'alias' } !~ /^inet/ and croak "!!! default is not through inet interface !!!";
 
       $net_interfaces{ $ni }->{ 'default' } = 1;
       $net_interfaces{ $ni }->{ 'gw' } = $gw;

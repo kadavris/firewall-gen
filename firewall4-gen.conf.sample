@@ -155,6 +155,7 @@
       'incoming reject' => { # REJECT these.
          # Format of keys: 'proto:method', where proto is tcp,udp. method is --reject-with argument
          # The logic behind overlapping ranges is that you may want to see attempts statistics for some separate ports
+         #   So write your rules down from more specific to more broad-ranged
 
         'tcp:tcp-reset' => [
            'ftp,ftp-data', 'ssh,telnet', 'smtp,urd,pop3,imap,imap3,imaps,pop3s',
@@ -269,6 +270,7 @@
   # -------------------------------------
   'hassio' => { # Home Assistant in container
       'mac' => '', # no MAC means virtual
+      'options' => { 'volatile' => 1 }, # volatile means that interface may not be present at the generation phase. use with caution
       'chains'       => { 'in' => 'hassio_in', 'out' => 'hassio_out' },
       'rules func'   => \&virtual_rules, # dirty hack to implement different approach for specific networks
       'ip4 addr'     => [ '172.30.32.1' ],
@@ -298,6 +300,7 @@
   'docker0' => { # docker's own interface
       'mac' => '', # no MAC means virtual.
       'name' => 'docker',
+      'options' => { 'volatile' => 1 }, # volatile means that interface may not be present at the generation phase. use with caution
       'chains'       => { 'in' => 'docker0_in', 'out' => 'docker0_out' },
       'rules func'   => \&virtual_rules,
       'ip4 addr'     => [ '172.17.0.1' ],
