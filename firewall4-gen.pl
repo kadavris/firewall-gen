@@ -109,6 +109,15 @@ for my $ifkey ( sort( keys %net_interfaces ) ) # construct virtual interfaces ru
 
   my $if = $net_interfaces{ $ifkey };
 
+  if( exists( $if->{ 'options' } ) )
+  {
+    if( exists( $if->{ 'options' }->{ 'disabled' } ) )
+    {
+      print "- Skipping disabled: ", $if->{ 'alias' }, '/', $if->{ 'if name' },"\n";
+      next;
+    }
+  }
+
   if ( $if->{ 'mac' } ne '' )
   {
     print "+ Adding generic physical: ", $if->{ 'alias' }, '/', $if->{ 'if name' },"\n";
@@ -126,7 +135,7 @@ for my $ifkey ( sort( keys %net_interfaces ) ) # construct virtual interfaces ru
 # finishing touches
 
 # silently drop some stuff on forward:
-for my $n ( qw~224.0.0.0/4~ )
+for my $n ( qw~224.0.0.0/4 240.0.0.0/4~ )
 {
   add_hostport_to( 'FORWARD', '-d', $n, '-j DROP' );
 }
@@ -305,19 +314,18 @@ sub generic_physical_rules
 
   make_log_chains( $ifkey, 'b' );
 
-  log_it( $chain_in, $ifkey . '-INV', 'DROP', '-m conntrack --ctstate INVALID' );
+  log_it( $chain_in, '-INV', 'DROP', '-m conntrack --ctstate INVALID' );
   addto( $chain_in, '-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' );
 
   # this is the kind of stuff we don't want to be in the log
-  my $chain = $ifkey . '_slntdrop';
+  my $chain = $ifkey . '_silentdrop';
   make_chain( $chain_in, $chain );
+    addto( $chain_in, '-j', $chain );
 
-  for my $n ( @{ $if->{ 'silent drop list' } } )
-  {
-    add_hostport_to( $chain, '-d', $n, '-j DROP' );
-  }
-
-  addto( $chain_in, '-j', $chain );
+    for my $n ( @{ $if->{ 'silent drop list' } } )
+    {
+      add_hostport_to( $chain, '-d', $n, '-j DROP' );
+    }
 
   add_access_rules( $if );
 
@@ -359,7 +367,7 @@ sub virtual_rules
   {
     make_chain( 'INPUT', $chain_in, '********* Virtual: ' . $chain_in . ' *******' );
     addto( $chain_in, '-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' );
-    log_it( $chain_in, $if->{ 'alias' } . '-INV', 'DROP', '-m conntrack --ctstate INVALID' );
+    log_it( $chain_in, '-INV', 'DROP', '-m conntrack --ctstate INVALID' );
 
     #for my $n ( @{ $if->{ 'silent drop list' } } )
     #{
@@ -371,7 +379,7 @@ sub virtual_rules
   {
     make_chain( 'OUTPUT', $chain_out, '********* Virtual: ' . $chain_out . ' *******' );
     addto( $chain_out, '-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' );
-    log_it( $chain_out, $if->{ 'alias' } . '-INV', 'DROP', '-m conntrack --ctstate INVALID' );
+    log_it( $chain_out, '-INV', 'DROP', '-m conntrack --ctstate INVALID' );
 
     #for my $n ( @{ $if->{ 'silent drop list' } } )
     #{
@@ -1093,7 +1101,14 @@ sub add_access_rules
       addto( $chain, '-s', $elem, '-j RETURN' ); # good
     }
 
+    for my $proto ( qw~tcp udp~ ) # DHCP/BOOTP. let it be relaxed about tcp/udp specifics for now
+    {
+      my $ports='bootps,bootpc,dhcp-failover,dhcp-failover2,dhcpv6-client';
+      addto( $chain, '-d 255.255.255.255 -p', $proto, '-m conntrack --ctstate NEW -m multiport --dports', $ports, '-j RETURN' );
+      addto( $chain, '-s 169.254.0.0/16 -p', $proto, '-m conntrack --ctstate NEW -m multiport --dports', $ports, '-j RETURN' );
+    }
     addto( $chain, '-s 0.0.0.0 -j RETURN' ); # dhcp pre-pass. if it is disabled it will be dropped later
+
     addto( $chain, '-j', $if->{ 'droplog chains' }->{ 'in' } ); # bad
 
 
@@ -1167,7 +1182,7 @@ sub add_access_rules
       addto( $chain, '-p tcp --tcp-flags SYN,ACK,FIN,RST RST -m limit --limit 1/m -j RETURN' );
       addto( $chain, '-p icmp --icmp-type  8 -m limit --limit 10/m -j ACCEPT' );
       addto( $chain, '-p icmp --icmp-type 11 -m limit --limit 10/m -j ACCEPT' );
-      log_it( $chain, $ifalias . '-SCANS', 'DROP', '' );
+      log_it( $chain, '', 'DROP', '' );
 
       addto( $chain_in, '-j', $chain );
     } # limit scans
@@ -1650,7 +1665,7 @@ sub scan_if
       while( )
       {
         last if $if->{ 'ip4 addr' }->[ $i ] eq $addr;
-        --$i < 0 and croak "!!! $if_real_name: $addr unknown !!!";
+        --$i < 0 and croak "!!! $if_real_name: $addr not in config !!!";
       }
 
       $mask  != $if->{ 'ip4 mask'  }->[ $i ] and croak "!!! $if_real_name: $addr mask mismatch: $mask !!!";
