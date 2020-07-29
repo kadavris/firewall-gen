@@ -820,17 +820,17 @@ sub add_proto_ports_rules
   {
     my @port_list = ([]); # pack together to optimize via -m multiport
 
-    my $proto;
+    my $real_proto;
     if ( $config_proto ne 'bcast' )
     {
-      $proto = $config_proto;
+      $real_proto = $config_proto;
     }
     else
     {
-      $proto = 'udp';
+      $real_proto = 'udp';
     }
 
-    for my $port ( keys %{ $rules->{ $proto } } )
+    for my $port ( keys %{ $rules->{ $config_proto } } )
     {
       if ( $#{ $port_list[ $#port_list ] } == 15 ) # 16 max per multiport
       {
@@ -879,45 +879,45 @@ sub add_proto_ports_rules
 
         if ( $port_set->[0] eq '+' ) # no restrictions on i-face + internal forward.
         {
-          addto( $chain, $from_to, '-p', $proto, '-j ACCEPT' );
-          addto( 'FORWARD', '-i', $if->{ 'if name' }, '-s', $addr, '-p', $proto, '-j ACCEPT' );
+          addto( $chain, $from_to, '-p', $real_proto, '-j ACCEPT' );
+          addto( 'FORWARD', '-i', $if->{ 'if name' }, '-s', $addr, '-p', $real_proto, '-j ACCEPT' );
         }
         elsif ( $port_set->[0] eq '*' ) # in: relaxed access to our iface. out: net scope only
         {
-          addto( $chain, $from_to, '-p', $proto, '-j ACCEPT' );
+          addto( $chain, $from_to, '-p', $real_proto, '-j ACCEPT' );
         }
         elsif ( $port_set->[0] eq '-' ) # drop him!
         {
           if ( exists( $rules->{ 'logdrop' } ) )
           {
-            if ( $proto eq 'icmp' )
+            if ( $real_proto eq 'icmp' )
             {
               addto( $chain, $from_to, '-p icmp -j', $chain_drop );
             }
             else
             {
-              dup_rule( [ $rules->{ 'logdrop' } ], $chain, $from_to, '-p', $proto, '-m multiport --dports %1', '-j', $chain_drop );
+              dup_rule( [ $rules->{ 'logdrop' } ], $chain, $from_to, '-p', $real_proto, '-m multiport --dports %1', '-j', $chain_drop );
             }
           }
 
-          addto( $chain, $from_to, '-p', $proto, '-j DROP' );
+          addto( $chain, $from_to, '-p', $real_proto, '-j DROP' );
         }
         else # very specific ports/icmp types
         {
            my $port = $#{ $port_set } == 0 ? '--dport ' . $port_set->[0] : '-m multiport --dports ' . join( ',', @{ $port_set } );
 
-           if ( $proto eq 'icmp' )
+           if ( $real_proto eq 'icmp' )
            {
              addto( $chain, $from_to, '-p icmp --icmp-type', $port, '-j ACCEPT' );
            }
            else
            {
-             addto( $chain, $from_to, '-p', $proto, $port, '-j ACCEPT' );
+             addto( $chain, $from_to, '-p', $real_proto, $port, '-j ACCEPT' );
            }
         }
       } # for my $ipno
     } # for my $port_set
-  } # for $proto
+  } # for $config_proto
 } # sub add_proto_ports_rules
 
 ###############################################################################
