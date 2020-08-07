@@ -25,7 +25,7 @@ my $warnings_count; # da same
 my $cfg = 'firewall4-gen.conf';
 
 GetOptions(
-  'd=i' => \$debug,
+  'd' => \$debug,
   'v=i' => \$verboseness,
 );
 
@@ -336,6 +336,7 @@ sub generic_physical_rules
 
 ###############################################################################
 # This interface is assumed to be most secure and trusted.
+# NOTE: this soon will be converted to generic physical interface!
 sub lan_rules
 {
   my $chain_in = $lan->{ 'chains' }->{ 'in' };
@@ -553,46 +554,64 @@ sub dup_app_rules
 }
 
 ##########################################################################################
-# in: portlist string (see config)[, bool: don't pack]
-# out: arrayref or undef
+# in: portlist string: port1,port2-port3,port4... [, bool: don't pack]
+# pack means combine ports in a way suitable for dense -m multiport
+# out: undef if empty or error
+#   [ 'port1', 'port2' ... ] if not packed
+#   [ 'port1,port2,...', 'portN,portN+1...' ... ] if packed
 sub parse_portlist
 {
-#print "parse_portlist(): '$_[0]'\r\n";
-  my @pl = split( ',', $_[0] );
-  $#pl == -1 and return undef;
-  my $o = [];
-
+  my $s = $_[0];
   my $packit = $_[1] // 1;
-  my $count = 0;
+
+  $s =~ s/\s+//g;
+
+  my @pl = split( ',', $s );
+
+  if ( $#pl == -1 )
+  {
+    print "\n\n??? WARNING: parse_portlist(): got empty list. There is high probability that this is an error in config\n";
+    return undef;
+  }
+
+  my $o = []; # for output
+
+  my $count = 0; # used for packing
 
   for my $p ( @pl ) # sanity check and packing for -m multiport
   {
-    if ( $p eq '+' || $p eq '-' || $p eq '*'  )
+    if ( $p eq '+' || $p eq '-' || $p eq '*'  ) # global stuff comes separate
     {
       push @$o, $p;
       $count = 0;
     }
-    elsif ( $p =~ /^(\d+(:\d+)?|[a-z]\w+)$/i )
+
+    elsif ( $p =~ /^(\d+([-:]\d+)?|[a-z]\w+)$/ ) # port1[-:]portN or named port
     {
-      my $places = defined($2) ? 2 : 1;
+      my $places = defined( $2 ) ? 2 : 1;
+      $p =~ s/-/:/g;
 
       if ( ( ! $packit ) || ( $count == 0 ) || ( $count + $places > 15 ) ) # push new
       {
         push @$o, $p;
         $count = 0; # it'll add up later
       }
-      else
+
+      else # packing: appending to the last element
       {
         $o->[-1] .= ',' . $p;
       }
 
       $count += $places;
     }
+
     else
     {
-      return undef;
+      croak "!!! got invalid port definition from $_[0]";
     }
   }
+
+  $debug and print "\n!DBG: parse_portlist(): in: $s\n!DBG:\tparsed: <", join('> <', @$o ), ">\n";
 
   return $o;
 }
@@ -683,7 +702,7 @@ sub get_class_access_rules
 
   foreach my $r ( @config_rules ) # getting parent's and own merged
   {
-    print "<$r> ";
+    print "  <$r>";
 
     # easy add ones without parameters:
     if ( grep( /^$r$/, ( 'boot', 'dhcp', 'drop bad tcp', 'limit scans', 'log bad tcp', 'rtsp', 'quarantine' )) )
@@ -732,16 +751,15 @@ sub get_class_access_rules
         $protocols = 'tcp,udp';
       }
 
+      $debug and print "\n!DBG: config: $r\n!DBG:\tparsed: $protocols : <", join('> <', @$portlist ), ">\n";
+
       for my $proto ( split( /,/, $protocols ) )
       {
         for my $port ( @$portlist ) # we need non-packed list here
         {
           if ( $port eq '+' || $port eq '*' || $port eq '-' ) # get rid of any of parent's specifics
           {
-            for my $k ( keys %{ $rules->{ $proto } } )
-            {
-              delete $rules->{ $proto }->{ $k };
-            }
+            $rules->{ $proto } = { };
           }
           else # specific port name or number
           {
@@ -755,7 +773,7 @@ sub get_class_access_rules
       } # for $proto
 
       next;
-    } # if portlist
+    } # if ( $r =~ /^(all|any|bcast|icmp|tcp|udp):(.+)/ ) # portlist follows the colon.
 
     # internet: options: c - clients can, i - interface can. default is both can
     if ( $r =~ /^i-?net(:[cib])?/ )
@@ -771,12 +789,13 @@ sub get_class_access_rules
       next;
     }
 
-    next if $r eq ''; # product of some replacements
+    next if $r eq ''; # maybe a product of some replacements
 
     croak "!!! unknown access rule: '$r' !!!";
-  } # foreach $r
+  } # foreach my $r ( @config_rules ) # getting parent's and own merged
 
   print "\n";
+
   $classes{ $class } = [ undef, $rules ];
 
   return $rules;
@@ -800,11 +819,12 @@ sub default_args
 }
 
 ###############################################################################
-# in: if ref, rules ref, address, chain name, specify source, is output chain
+# in: interface ref, rules ref, address, chain name, specify source, is output chain
 # parses clauses like 'tcp:23,ssh' and adds rules
 sub add_proto_ports_rules
 {
   my ( $if, $rules, $addr, $chain, $opts ) = @_;
+
   $opts = default_args( $opts, { 'dedicated chain' => 0, 'is output' => 0, 'external' => 0 } );
 
   my $src = ''; # for a host chain we skip using -s addr
@@ -821,6 +841,7 @@ sub add_proto_ports_rules
     my @port_list = ([]); # pack together to optimize via -m multiport
 
     my $real_proto;
+
     if ( $config_proto ne 'bcast' )
     {
       $real_proto = $config_proto;
@@ -830,17 +851,21 @@ sub add_proto_ports_rules
       $real_proto = 'udp';
     }
 
+    my $mp_count = 0; # for packing
+
     for my $port ( keys %{ $rules->{ $config_proto } } )
     {
-      if ( $#{ $port_list[ $#port_list ] } == 15 ) # 16 max per multiport
+      if ( $mp_count == 15 ) # 16 max per multiport
       {
         push @port_list, []; #add new set
+        $mp_count = 0;
       }
 
       push @{ $port_list[ -1 ] }, $port; # another port in this set
+      $mp_count += ( $port =~ /:/ ? 3 : 1 );
     }
 
-    next if ( $#port_list == 0 && $#{ $port_list[0] } == -1 ); # no specific for this protocol
+    next if ( $#port_list == 0 && $#{ $port_list[0] } == -1 ); # no specifics for this protocol
 
     for my $port_set ( @port_list )
     {
@@ -853,17 +878,19 @@ sub add_proto_ports_rules
                      #'255.255.255.255', # is the limited broadcast address (limited to all other nodes on the LAN) RFC 919
                    );
       }
+
       elsif( exists $opts->{ 'index' } ) # ruleset w defaults for a network - use specified destination ip
       {
         @dst_ips = ( $if->{ 'ip4 addr' }->[ $opts->{ 'index' } ] );
       }
+
       else # dedicated host chain case - listing all interface ips
       {
         @dst_ips = ( @{ $if->{ 'ip4 addr' } } );
       }
 
-
-      for my $ipno ( 0..$#dst_ips ) # for each of interface address
+      # for each of interface address
+      for my $ipno ( 0..$#dst_ips )
       {
         my $dst = $dst_ips[ $ipno ];
         my $from_to;
@@ -877,15 +904,18 @@ sub add_proto_ports_rules
           $from_to = $src;
         }
 
-        if ( $port_set->[0] eq '+' ) # no restrictions on i-face + internal forward.
+        # no restrictions on i-face + forwarding.
+        if ( $port_set->[0] eq '+' )
         {
           addto( $chain, $from_to, '-p', $real_proto, '-j ACCEPT' );
           addto( 'FORWARD', '-i', $if->{ 'if name' }, '-s', $addr, '-p', $real_proto, '-j ACCEPT' );
         }
+
         elsif ( $port_set->[0] eq '*' ) # in: relaxed access to our iface. out: net scope only
         {
           addto( $chain, $from_to, '-p', $real_proto, '-j ACCEPT' );
         }
+
         elsif ( $port_set->[0] eq '-' ) # drop him!
         {
           if ( exists( $rules->{ 'logdrop' } ) )
@@ -902,9 +932,10 @@ sub add_proto_ports_rules
 
           addto( $chain, $from_to, '-p', $real_proto, '-j DROP' );
         }
+
         else # very specific ports/icmp types
         {
-           my $port = $#{ $port_set } == 0 ? '--dport ' . $port_set->[0] : '-m multiport --dports ' . join( ',', @{ $port_set } );
+           my $port = $#{ $port_set } == 0 ? '--dport ' . $port_set->[0] : '-m multiport --dports ' . join( ',', @$port_set );
 
            if ( $real_proto eq 'icmp' )
            {
@@ -1071,8 +1102,9 @@ sub add_ruleset
     }
   } # iface own rules
 
+  # this actually breaks semi-trusted host on un-trusted net case, when net is strict, but table's default is ACCEPT for any reason
   # enforce the default mode: this should be the last
-  addto( $chain, $src, '-j', $table_default );
+  #addto( $chain, $src, '-j', $table_default );
 
   # nothing should be beyond this point...
 
@@ -1129,7 +1161,9 @@ sub add_access_rules
       addto( $mism_ip_chain, '-j LOG --log-level info --log-prefix', '"ipt4-' . $ifalias . ' MAC-,IP+" ' );
       addto( $mism_ip_chain, '-j DROP' );
 
-    for my $host ( sort( keys %{ $host_list } ) ) # adding individual host's rules. make it diff-friendly
+    # HOSTS:
+    # adding individual host's rules. make it diff-friendly sorted
+    for my $host ( sort( keys %{ $host_list } ) )
     {
       gethostbyname $host or croak "!!! Host doesn't resolve: '$host' !!!";
 
@@ -1200,7 +1234,7 @@ sub add_access_rules
 
       add_ruleset( $if, $r, $ch, $if->{ 'ip4 addr' }->[ $i ], { 'index' => $i, 'dedicated chain' => 1, 'is output' => 1, 'external' => 0 } );
     }
-  }
+  } # for my $i ( 0..$#{ $if->{ 'ip4 net' } } ) # for each of interface nets
 } # sub add_access_rules()
 
 ##########################################################################################
@@ -1669,8 +1703,8 @@ sub scan_if
       }
 
       $mask  != $if->{ 'ip4 mask'  }->[ $i ] and croak "!!! $if_real_name: $addr mask mismatch: $mask !!!";
-      $bcast ne $if->{ 'ip4 bcast' }->[ $i ] and croak "!!! $if_real_name: $addr bcast mismatch: computed: $bcast !!!";
-      $net   ne $if->{ 'ip4 net'   }->[ $i ] and croak "!!! $if_real_name: $addr net mismatch: computed: $net !!!";
+      $bcast ne $if->{ 'ip4 bcast' }->[ $i ] and croak "!!! $if_real_name: $addr bcast mismatch: computed: '$bcast' !!!";
+      $net   ne $if->{ 'ip4 net'   }->[ $i ] and croak "!!! $if_real_name: $addr net mismatch: computed: '$net' !!!";
 
       next;
     }
