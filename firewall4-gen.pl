@@ -1,13 +1,11 @@
 #!/bin/perl
-# This is firewall rules generator.
-# Made by Andrej Pakhutin (pakhutin@gmail.com)
-# The repository is on github.
 use strict;
 use warnings;
 use Carp;
 use Getopt::Long;
 use Storable qw(dclone); # deep clone used to init access class with parent's data
 
+my $default_if; # default route interface ref. used for making right forwards.
 my %net_interfaces; #main interfaces config
 my $save_file; # rules output file
 my @silent_drop_by_dst; # destinations to drop always
@@ -22,7 +20,18 @@ my $verboseness = 1; # at zero show minimal info needed to confirm what's done
 my $errors_count;   # will not load new config if any
 my $warnings_count; # da same
 
+my $interface_default_options = {
+  'enabled' => 1,
+  'volatile' => 0,
+};
+
 my $cfg = 'firewall4-gen.conf';
+
+my $version = '1.5';
+
+##########################################################
+print "Firewall rules generation tool. V$version\nMade my Andrej Pakhutin (pakhutin<at>gmail)\n";
+print "Repository is at https://github.com/kadavris\n";
 
 GetOptions(
   'd' => \$debug,
@@ -71,7 +80,7 @@ init(); # pre-fill some names and addresses for simpler configuration
 
 # make shortcuts
 my $lan  = $net_interfaces{ 'lan'  }; # This interface is assumed to be most secure and trusted.
-my $inet = $net_interfaces{ 'inet' }; # default
+my $inet = $net_interfaces{ 'inet' }; # internet. if any
 
 my $out_file;
 open $out_file, '>', $save_file or die "$save_file: $!";
@@ -85,11 +94,11 @@ table_start( 'filter' );
 
 ##################################
 ##################################
-put_comment('INPUT', 'common stuff');
+put_comment( 'INPUT', 'common stuff' );
 addto( 'INPUT', '-i lo -j ACCEPT' ); # allmighty 127.0.0.1
 make_log_chains('INPUT', 'b');
 
-make_log_chains('FORWARD', 'b');
+make_log_chains( 'FORWARD', 'b' );
 addto( 'FORWARD', '-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' );
 
 put_comment( 'OUTPUT', 'OUTPUT chain');
@@ -97,25 +106,49 @@ addto( 'OUTPUT', '-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' );
 
 ##################################
 ##################################
-inet_rules( 'inet' );
-lan_rules();
-
-for my $ifkey ( sort( keys %net_interfaces ) ) # construct virtual interfaces rules. make it diff-friendly
+if ( $inet )
 {
-  if ( $ifkey eq 'inet' || $ifkey eq 'lan' )
+  $inet->{ 'options' } = make_complete_set( $inet->{ 'options' }, $interface_default_options, 1 );
+
+  if ( $inet->{ 'options' }->{ 'enabled' } )
+  {
+    $default_if != $inet and croak "deafult route is not via inet interface!";
+
+    inet_rules( 'inet' );
+  }
+  else
+  {
+    print "\n>>> NOTE: inet interface IS DISABLED and default is going via " . $default_if->{ 'alias' } . "\n\n";
+  }
+}
+else
+{
+  if ( $default_if )
+  {
+    print "\n>>> NOTE: inet interface is undefined and default is going via " . $default_if->{ 'alias' } . "\n\n";
+  }
+  else
+  {
+    print "\n>>> NOTE: NO DEFAULT ROUTE.\n\n";
+  }
+}
+# END: inet
+
+for my $ifkey ( sort( keys %net_interfaces ) ) # construct other interfaces rules. make it diff-friendly
+{
+  if ( $ifkey eq 'inet' )
   {
     next;
   }
 
   my $if = $net_interfaces{ $ifkey };
 
-  if( exists( $if->{ 'options' } ) )
+  $if->{ 'options' } = make_complete_set( $if->{ 'options' }, $interface_default_options, 1 );
+
+  if( ! $if->{ 'options' }->{ 'enabled' } )
   {
-    if( exists( $if->{ 'options' }->{ 'disabled' } ) )
-    {
-      print "- Skipping disabled: ", $if->{ 'alias' }, '/', $if->{ 'if name' },"\n";
-      next;
-    }
+    print "\n- Skipping disabled: ", $if->{ 'alias' }, '/', $if->{ 'if name' },"\n\n";
+    next;
   }
 
   if ( $if->{ 'mac' } ne '' )
@@ -175,12 +208,14 @@ close $out_file;
 ###############################################################################
 ###############################################################################
 ###############################################################################
-# block chain is interfering somehow with new and legitimate outgoing connections setup, so put it after conntrack ESTAB
 # in: name of the key in settings. used for multiple inet interfaces
 sub inet_rules
 {
   my $key_name = $_[0];
   my $if = $net_interfaces{ $key_name };
+
+  $if->{ 'default' } or croak "inet interface is not the default route!";
+
   my $chain;
 
   my $chain_in = $if->{ 'chains' }->{ 'in' };
@@ -332,25 +367,6 @@ sub generic_physical_rules
   addto( $chain_in, '-j', $if->{ 'droplog chains' }->{ 'in' } ); # we want to see what's going on there
 
   addto( 'INPUT', '-i', $if->{ 'if name' }, '-j', $chain_in );
-}
-
-###############################################################################
-# This interface is assumed to be most secure and trusted.
-# NOTE: this soon will be converted to generic physical interface!
-sub lan_rules
-{
-  my $chain_in = $lan->{ 'chains' }->{ 'in' };
-  make_chain( 'INPUT', $chain_in, '************* LAN ************' );
-
-  make_log_chains('lan', 'b');
-
-  addto( $chain_in, '-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' );
-
-  add_access_rules( $lan );
-
-  addto( 'INPUT', '-i', $lan->{ 'if name' }, '-j', $chain_in );
-  #addto( 'OUTPUT', '-o', $lan->{ 'if name' }, '-j ACCEPT' );
-  #addto( 'FORWARD', '-o', $lan->{ 'if name' }, '-j ACCEPT' );
 }
 
 ###############################################################################
@@ -801,23 +817,6 @@ sub get_class_access_rules
   return $rules;
 } # sub get_class_access_rules
 
-
-###############################################################################
-# in: original hashref or undef, hashref of defaults
-# out: hashref of complete set
-sub default_args
-{
-  my ( $orig, $def ) = @_;
-  defined( $orig ) or return { %$def }; # make new hashref
-  for my $k ( keys %$def )
-  {
-    next if exists $orig->{ $k };
-    $orig->{ $k } = $def->{ $k };
-  }
-
-  return $orig;
-}
-
 ###############################################################################
 # in: interface ref, rules ref, address, chain name, specify source, is output chain
 # parses clauses like 'tcp:23,ssh' and adds rules
@@ -825,7 +824,7 @@ sub add_proto_ports_rules
 {
   my ( $if, $rules, $addr, $chain, $opts ) = @_;
 
-  $opts = default_args( $opts, { 'dedicated chain' => 0, 'is output' => 0, 'external' => 0 } );
+  $opts = make_complete_set( $opts, { 'dedicated chain' => 0, 'is output' => 0, 'external' => 0 } );
 
   my $src = ''; # for a host chain we skip using -s addr
 
@@ -959,7 +958,7 @@ sub add_proto_ports_rules
 sub add_ruleset
 {
   my ( $if, $rules, $chain, $addr, $opts ) = @_;
-  $opts = default_args( $opts, { 'dedicated chain' => 0, 'is output' => 0, 'external' => 0 } );
+  $opts = make_complete_set( $opts, { 'dedicated chain' => 0, 'is output' => 0, 'external' => 0 } );
 
   my $src = ''; # for a host chain we skip using -s addr
 
@@ -1008,19 +1007,27 @@ sub add_ruleset
     }
   } # if ( $opt->{ 'external' } )
 
-  # global rules:
+  ################ global rules:
 
-  if ( exists $rules->{ 'i-net' } )
+  if ( exists $rules->{ 'i-net' } and $default_if )
   {
     $addr eq '' and croak "chain $chain: 'i-net' needs an address!";
+
     my $mode = $rules->{ 'i-net' }; # (c)lient/(s)erver/(b)oth
 
-    addto( 'nat:POSTROUTING', '-o', $inet->{ 'if name' }, '-s', $addr, '-j SNAT --to-source', $inet->{ 'ip4 addr' }->[0] );
+    #if ( $inet and $default_if == $inet ) # if we're not directly connected to inet then NAT will provided somewhere else
+    #{
+      addto( 'nat:POSTROUTING', '-o', $default_if->{ 'if name' }, '-s', $addr, '-j SNAT --to-source', $default_if->{ 'ip4 addr' }->[0] );
+    #}
 
     if ( ! exists $rules->{ 'norestrict' } ) # don't duplicate
     {
-      addto( $chain, $src, '-o', $inet->{ 'if name' }, '-j ACCEPT' );
-      addto( 'FORWARD', '-i', $if->{ 'if name' }, '-s', $addr, '-o', $inet->{ 'if name' }, '-j ACCEPT' );
+      addto( $chain, $src, '-o', $default_if->{ 'if name' }, '-j ACCEPT' );
+
+      if ( $default_if and $default_if != $if ) # in case of missing/disabled inet if
+      {
+        addto( 'FORWARD', '-i', $if->{ 'if name' }, '-s', $addr, '-o', $default_if->{ 'if name' }, '-j ACCEPT' );
+      }
     }
   } # i-net
 
@@ -1574,6 +1581,34 @@ sub init
   );
 }
 
+###############################################################################
+# Fills missing keys from original hashref with ones from secondary: default
+# in: original hashref or undef, hashref of defaults, check original keys
+# out: hashref of complete set
+sub make_complete_set
+{
+  my ( $orig, $def, $check ) = @_;
+
+  defined( $orig ) or return { %$def }; # make new hashref
+
+  if ( $check ) # sanity check for original to not have keys that not in defaults
+  {
+    for my $k ( keys %$orig )
+    {
+      exists( $def->{ $k } ) or croak "defaults has no key '$k'. check your config or hash \$interface_default_options";
+    }
+  }
+
+  for my $k ( keys %$def )
+  {
+    next if exists $orig->{ $k };
+
+    $orig->{ $k } = $def->{ $k };
+  }
+
+  return $orig;
+}
+
 ##########################################################################################
 # pure debug service: check for undef args and report it verbosely
 # in: caller name, any original args
@@ -1725,7 +1760,7 @@ sub scan_if
   {
     next if exists( $net_interfaces{ $ni }->{ 'alias' } );
 
-    if ( exists( $net_interfaces{ $ni }->{ 'options' } ) && exists( $net_interfaces{ $ni }->{ 'options' }->{ 'volatile' } ) )
+    if ( $net_interfaces{ $ni }->{ 'options' }->{ 'volatile' } )
     {
       print "!!! Volatile interface is not active now: $ni\n";
       # filling by the heart then
@@ -1761,10 +1796,11 @@ sub scan_if
     {
       next if $dev ne lc( $net_interfaces{ $ni }->{ 'if name' } );
 
-      $net_interfaces{ $ni }->{ 'alias' } !~ /^inet/ and croak "!!! default is not through inet interface !!!";
-
       $net_interfaces{ $ni }->{ 'default' } = 1;
       $net_interfaces{ $ni }->{ 'gw' } = $gw;
+
+      $default_if and croak "another default route found: " . $default_if->{ 'alias' } . ' and ' . $ni;
+      $default_if = $net_interfaces{ $ni };
     }
   }
 

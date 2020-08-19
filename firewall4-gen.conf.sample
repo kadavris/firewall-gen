@@ -125,6 +125,10 @@
 # 'access' sub-tree format:
 #    'host/ip' => [ 'mac', 'allowed tcp ports list', 'allowed udp ports list', 'allowed icmp ports list' ]
 #    '+' in ports list means no restrictions to any internal address, '*' - relaxed only to server's if, '-'|'' - drop all
+#
+# 'options' hash with default values (see $interface_default_options in code):
+#    'enabled' => 1 # interface is enabled
+#    'volatile' => 0 # interface may not be present at the generation phase. no rules made for it. use with caution
 
 %net_interfaces = ( # root keys: lan,inet,wifi,sec - are hardcoded names!
   'lan' => {
@@ -270,7 +274,7 @@
   # -------------------------------------
   'hassio' => { # Home Assistant in container
       'mac' => '', # no MAC means virtual
-      'options' => { 'volatile' => 1 }, # volatile means that interface may not be present at the generation phase. use with caution
+      'options' => { 'volatile' => 1 },
       'chains'       => { 'in' => 'hassio_in', 'out' => 'hassio_out' },
       'rules func'   => \&virtual_rules, # dirty hack to implement different approach for specific networks
       'ip4 addr'     => [ '172.30.32.1' ],
