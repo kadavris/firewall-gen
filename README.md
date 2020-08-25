@@ -8,9 +8,9 @@
 * Default network-wide settings for unknown devices, like Wi-Fi guest clients
 * Pre-filters for common attack types with or without logging
 * Multiple networks/IPs support per interface
-* 2 fixed-purpose interfaces: internet and secure internal lan
+* 1 optional, fixed-purpose interface - internet direct connection
 * unlimited secondary physical interfaces
-* unlimited virtual interfaces like containers
+* unlimited virtual interfaces like containers, with in/out access settings
 * Pre-flight checks of configuration
 * probably some more...
 

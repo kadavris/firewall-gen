@@ -570,25 +570,26 @@ sub dup_app_rules
 }
 
 ##########################################################################################
-# in: portlist string: port1,port2-port3,port4... [, bool: don't pack]
+# in: TAG, portlist string: port1,port2-port3,port4... [, bool: don't pack]
 # pack means combine ports in a way suitable for dense -m multiport
 # out: undef if empty or error
 #   [ 'port1', 'port2' ... ] if not packed
 #   [ 'port1,port2,...', 'portN,portN+1...' ... ] if packed
 sub parse_portlist
 {
-  my $s = $_[0];
-  my $packit = $_[1] // 1;
+  my $tag = $_[0];
+  my $s = $_[1];
+  my $packit = $_[2] // 1;
 
   $s =~ s/\s+//g;
 
   my @pl = split( ',', $s );
 
-  if ( $#pl == -1 )
-  {
-    print "\n\n??? WARNING: parse_portlist(): got empty list. There is high probability that this is an error in config\n";
-    return undef;
-  }
+  #if ( $#pl == -1 )
+  #{
+  #  print "\n\n??? WARNING: parse_portlist(): got empty list. There is high probability that this is an error in config\n";
+  #  return undef;
+  #}
 
   my $o = []; # for output
 
@@ -602,10 +603,9 @@ sub parse_portlist
       $count = 0;
     }
 
-    elsif ( $p =~ /^(\d+([-:]\d+)?|[a-z]\w+)$/ ) # port1[-:]portN or named port
+    elsif ( $p =~ /^(\d+(:\d+)?|[a-z]\w+)$/ ) # port1[-:]portN or named port
     {
       my $places = defined( $2 ) ? 2 : 1;
-      $p =~ s/-/:/g;
 
       if ( ( ! $packit ) || ( $count == 0 ) || ( $count + $places > 15 ) ) # push new
       {
@@ -623,7 +623,7 @@ sub parse_portlist
 
     else
     {
-      croak "!!! got invalid port definition from $_[0]";
+      croak "!!! got invalid port definition from $tag, full list: " . $s . ' | element: "' . $p . '"';
     }
   }
 
@@ -633,19 +633,20 @@ sub parse_portlist
 }
 
 ##########################################################################################
-#in: existing tree or undef, addr:proto:portlist;... list as a string
+#in: TAG, existing tree or undef, addr:proto:portlist;... list as a string
 #out: {tree} ref: {addr}->{proto}->[ports]
 sub parse_app_list
 {
-  my $tree = $_[0] // {};
-  my @args = split( ';', $_[1] );
+  my $tag = $_[0];
+  my $tree = $_[1] // {};
+  my @args = split( ';', $_[2] );
 
   for my $app ( @args )
   {
     $app =~ /^([^:]*)(:([^:]*)(:(.*))?)?/; # addr:proto:portlist
     my $addr  = $1 // '*';
     my $protolist = $3 // '*';
-    my $ports = defined($5) ? parse_portlist( $5, 0 ) : [ '*' ]; # don't pack so we can sort them out
+    my $ports = defined( $5 ) ? parse_portlist( $tag . '/' . $_[1], $5, 0 ) : [ '*' ]; # don't pack so we can sort them out
 
     exists( $tree->{ $addr } ) or $tree->{ $addr } = {};
 
@@ -720,6 +721,8 @@ sub get_class_access_rules
   {
     print "  <$r>";
 
+    my $tag = 'class ' . $class . ', rule: ' . $r;
+
     # easy add ones without parameters:
     if ( grep( /^$r$/, ( 'boot', 'dhcp', 'drop bad tcp', 'limit scans', 'log bad tcp', 'rtsp', 'quarantine' )) )
     {
@@ -727,9 +730,9 @@ sub get_class_access_rules
       next;
     }
 
-    if ( $r =~ /^logdrop:?(.*)$/ )
+    if ( $r =~ /^logdrop(:(.+))?$/ )
     {
-      my $p = parse_portlist( $1 ne '' ? $1 : '0:1023' );
+      my $p = parse_portlist( $tag, defined( $2 ) ? $2 : '0:1023' );
 
       defined( $p ) or croak "Invalid portlist for logdrop: '$r'\n";
 
@@ -760,7 +763,7 @@ sub get_class_access_rules
     if ( $r =~ /^(all|any|bcast|icmp|tcp|udp):(.+)/ ) # portlist follows the colon.
     {
       my $protocols = $1;
-      my $portlist = parse_portlist( $2, 0 );
+      my $portlist = parse_portlist( $tag, $2, 0 );
 
       if ( $protocols eq 'all' || $protocols eq 'any' )
       {
@@ -801,7 +804,7 @@ sub get_class_access_rules
     # allow/deny outgoing traffic from this interface. Used for quarantined virtuals
     if ( $r =~ /^(allowto|denyto):(.+)?/ )
     {
-      $rules->{ $1 } = parse_app_list( $rules->{ $1 } // undef, $2 );
+      $rules->{ $1 } = parse_app_list( $tag, $rules->{ $1 } // undef, $2 );
       next;
     }
 
@@ -816,6 +819,21 @@ sub get_class_access_rules
 
   return $rules;
 } # sub get_class_access_rules
+
+###############################################################################
+sub port_sanity_check
+{
+  my ( $if, $proto, $port ) = @_;
+
+  if ( ( $port eq '+' ) || ( $port eq '*' ) || ( $port eq '-' )
+       || ( $port =~ /^\d+$/ ) || ( $port =~ /^[a-z]\w+$/ ) || ( $port =~ /^\d+:\d+$/ )
+     )
+  {
+    return;
+  }
+
+  croak "! ERROR: invalid port specification: '$port' for proto $proto, in " . $if->{ 'alias' } . "\n";
+}
 
 ###############################################################################
 # in: interface ref, rules ref, address, chain name, specify source, is output chain
@@ -854,14 +872,19 @@ sub add_proto_ports_rules
 
     for my $port ( keys %{ $rules->{ $config_proto } } )
     {
-      if ( $mp_count == 15 ) # 16 max per multiport
+      port_sanity_check( $if, $config_proto, $port );
+
+      my $places = ( $port =~ /:/ ? 2 : 1 );
+
+      if ( $mp_count + $places > 15 ) # 15 max per multiport
       {
         push @port_list, []; #add new set
         $mp_count = 0;
       }
 
       push @{ $port_list[ -1 ] }, $port; # another port in this set
-      $mp_count += ( $port =~ /:/ ? 3 : 1 );
+
+      $mp_count += $places;
     }
 
     next if ( $#port_list == 0 && $#{ $port_list[0] } == -1 ); # no specifics for this protocol

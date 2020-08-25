@@ -57,7 +57,7 @@
 #           portlist: +|-|*|portlist[,...]
 #           where: '+' - allow all, '-' = block all, '*' - relaxed access to _server_ iface
 #                  portlist  - portrange[,portrange...]
-#                  portrange - port[-port]
+#                  portrange - port[:port]
 #           multiple, entries for a single protocol are allowed.
 #           when there is '!' used before the port, the inverse meaning is applied (unimplemented!)
 
