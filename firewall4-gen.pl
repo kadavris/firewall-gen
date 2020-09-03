@@ -646,7 +646,7 @@ sub parse_app_list
     $app =~ /^([^:]*)(:([^:]*)(:(.*))?)?/; # addr:proto:portlist
     my $addr  = $1 // '*';
     my $protolist = $3 // '*';
-    my $ports = defined( $5 ) ? parse_portlist( $tag . '/' . $_[1], $5, 0 ) : [ '*' ]; # don't pack so we can sort them out
+    my $ports = defined( $5 ) ? parse_portlist( $tag . '/' . $app, $5, 0 ) : [ '*' ]; # don't pack so we can sort them out
 
     exists( $tree->{ $addr } ) or $tree->{ $addr } = {};
 
@@ -724,7 +724,7 @@ sub get_class_access_rules
     my $tag = 'class ' . $class . ', rule: ' . $r;
 
     # easy add ones without parameters:
-    if ( grep( /^$r$/, ( 'boot', 'dhcp', 'drop bad tcp', 'limit scans', 'log bad tcp', 'rtsp', 'quarantine' )) )
+    if ( grep( /^$r$/, ( 'boot', 'dhcp', 'drop bad tcp', 'limit scans', 'log bad tcp', 'rtsp', 'samba', 'quarantine' )) )
     {
       $rules->{ $r } = 1;
       next;
@@ -984,10 +984,10 @@ sub add_ruleset
   $opts = make_complete_set( $opts, { 'dedicated chain' => 0, 'is output' => 0, 'external' => 0 } );
 
   my $src = ''; # for a host chain we skip using -s addr
+  my $same_net; # netmask. used for enabling specific client's broadcasts like for samba
 
   my $droplog_chain = $if->{ 'droplog chains' }->{ $opts->{ 'is output' } ? 'out' :'in' };
   my $table_default = $tables{ $current_table }->{ 'defaults' }->{ $opts->{ 'is output' } ? 'OUTPUT' : 'INPUT' };
-
 
   if ( $addr ne '' && ! $opts->{ 'dedicated chain' } ) # non-dedicated chain: always need to specify address
   {
@@ -997,8 +997,32 @@ sub add_ruleset
   #print "\n + adding ruleset for address '$addr', if: ", $if->{'alias'}, ", dest chain: $chain\n";
   #print '     rule keys: ', join(', ', keys %{$rules}), "\n";
 
-  if ( $opts->{ 'external' } ) # external network hosts
+  if ( $opts->{ 'external' } ) # external network hosts: incoming to this interface
   {
+    if ( $opts->{ 'dedicated chain' } )
+    {
+      my $a = $addr;
+      if( $a !~ /^(\d+\.){3}\d+$/ ) # need to resolve first
+      {
+        $a = `/bin/ipcalc --no-decorate -o $a`;
+        chomp $a;
+      }
+
+      # finding net of client:
+      for my $n ( 0..$#{ $if->{ 'ip4 net' } } ) # for each of interface nets
+      {
+        my $s = $a . '/' . $if->{ 'ip4 mask' }->[ $n ];
+        $s = `/bin/ipcalc -b --no-decorate $s`;
+        chomp $s;
+
+        if ( $if->{ 'ip4 bcast' }->[ $n ] eq $s )
+        {
+           $same_net = $if->{ 'ip4 net' }->[ $n ];
+           last;
+        }
+      }
+    }
+
     # boot/dhcp is w/o IP yet. so be it first!
     my $noip = ''; # will be portlist
 
@@ -1027,6 +1051,12 @@ sub add_ruleset
     if ( exists( $if->{ 'access' } ) && exists( $if->{ 'access' }->{ 'hosts' } ) && exists( $if->{ 'access' }->{ 'hosts' }->{ $addr } ) )
     {
       addto ( $chain, '! -s', $addr, '-j', $if->{ 'alias' } . $tables{ $current_table }->{ 'common chains' }->{ 'mismatched ip' } );
+    }
+
+    if ( exists $rules->{ 'samba' } && defined( $same_net ) ) # we need this to enable not only direct access, but a little broadcast too
+    {
+       addto( $chain, $src, '-p tcp -d', $same_net, '-m multiport --dports 137:139,445 -j ACCEPT' ); # same net
+       addto( $chain, $src, '-p udp -d', $same_net, '-m multiport --dports 137:139,445 -j ACCEPT' ); # same net
     }
   } # if ( $opt->{ 'external' } )
 
