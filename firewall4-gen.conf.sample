@@ -48,18 +48,24 @@
 #       limit scans - limit icmp pings and tcp probes to advised level
 #       logdrop[:portlist] - for close monitored nets - log all packet drops. default portlist is 0-1023
 #       norestrict - no particular filtering except general rules in the generator script.
-#       quarantine[addr:proto:portlist;...] - close all/some OUTGOING ON THIS INTERFACE until it is an established session (except what's in i-net)
+#       quarantine[:addr:proto:portlist;...] - close all/some NEW OUTGOING ON THIS INTERFACE
+#       samba - samba support for incoming connections
 #
 #       proto:portlist
-#           - when standalone - allow _incoming_to_server's_matching_ip_ by protocol & port(s).
-#           - whein used as a modifier for some other stuff like quarantine - set what block
+#           - when standalone (not a modifier for other statement like quarantine):
+#             if host/net class - allow _incoming_to_server's_matching_ip_ by protocol & port(s).
+#             if interface class - allow _OUTGOING_ from this interface.
+#           - when used as a modifier for some other stuff like quarantine - set what block
 #           proto: all|any|bcast|icmp|tcp|udp
 #           portlist: +|-|*|portlist[,...]
-#           where: '+' - allow all, '-' = block all, '*' - relaxed access to _server_ iface
+#           where: '+' - allow all in or out (depending on where this class used: host/net or interface),
+#                  '-' = block all in or out,
+#                  '*' - relaxed access to _server_ iface. No sense to use as interface's class, which is output type
 #                  portlist  - portrange[,portrange...]
-#                  portrange - port[:port]
+#                  portrange - portname|portnumber[:portnumber]
 #           multiple, entries for a single protocol are allowed.
-#           when there is '!' used before the port, the inverse meaning is applied (unimplemented!)
+#           when there is '!' used before the port, the inverse meaning is applied (almost unimplemented!)
+#           bcast uses 224.0.0.0/4 and 240.0.0.0/4 nets as destination.
 
 %classes = (
   'net un-trusted' => [ '', 'tcp:-', 'udp:-', 'icmp:-' ], # base class: no-nothing

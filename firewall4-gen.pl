@@ -3,6 +3,8 @@ use strict;
 use warnings;
 use Carp;
 use Getopt::Long;
+#use Net::IP;  # to get rid of ipcalc
+#use Net::DNS; # for advanced stuff like multi-ip client hosts
 use Storable qw(dclone); # deep clone used to init access class with parent's data
 
 my $default_if; # default route interface ref. used for making right forwards.
@@ -27,7 +29,7 @@ my $interface_default_options = {
 
 my $cfg = 'firewall4-gen.conf';
 
-my $version = '1.5';
+my $version = '1.6';
 
 ##########################################################
 print "Firewall rules generation tool. V$version\nMade my Andrej Pakhutin (pakhutin<at>gmail)\n";
@@ -96,13 +98,13 @@ table_start( 'filter' );
 ##################################
 put_comment( 'INPUT', 'common stuff' );
 addto( 'INPUT', '-i lo -j ACCEPT' ); # allmighty 127.0.0.1
-make_log_chains('INPUT', 'b');
 
-make_log_chains( 'FORWARD', 'b' );
-addto( 'FORWARD', '-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' );
-
-put_comment( 'OUTPUT', 'OUTPUT chain');
-addto( 'OUTPUT', '-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' );
+for my $ch ( qw( INPUT OUTPUT FORWARD) )
+{
+  make_log_chains( $ch, 'b');
+  log_it( $ch, 'INV', 'DROP', '-m conntrack --ctstate INVALID' );
+  addto( $ch, '-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' );
+}
 
 ##################################
 ##################################
@@ -214,7 +216,7 @@ sub inet_rules
   my $key_name = $_[0];
   my $if = $net_interfaces{ $key_name };
 
-  $if->{ 'default' } or croak "inet interface is not the default route!";
+  $if->{ 'default' } == 1 or croak "inet interface is not the default route!";
 
   my $chain;
 
@@ -304,9 +306,6 @@ sub inet_rules
     } # proto
   } # category
 
-  # log new ssh sessions just in case
-  #log_it( $chain_in, 'in-OK', 'ACCEPT', '-d', $ip, '-p tcp --dport 7273 -m conntrack --ctstate NEW' );
-
   #addto( $chain_in, '-d', $ip, '-p icmp --icmp-type  8', '-m limit --limit 1/m -j ACCEPT' );
   #addto( $chain_in, '-d', $ip, '-p icmp --icmp-type 11', '-m limit --limit 1/m -j ACCEPT' );
 
@@ -342,15 +341,17 @@ sub generic_physical_rules
 {
   my ( $ifkey, $if ) = @_;
 
-  my ( $ip, $net ) = ( $if->{ 'ip4 addr' }->[0], $if->{ 'ip4 net' }->[0] );
-
   my $chain_in = $if->{ 'chains' }->{ 'in' };
+  my $chain_out = $if->{ 'chains' }->{ 'out' } // '';
+
   make_chain( 'INPUT', $chain_in, '************ ' . $if->{ 'if name' } . ' ***********' );
 
-  make_log_chains( $ifkey, 'b' );
+  if ( $chain_out ne '' )
+  {
+    make_chain( 'OUTPUT', $chain_out, '************ ' . $if->{ 'if name' } . ' ***********' );
+  }
 
-  log_it( $chain_in, '-INV', 'DROP', '-m conntrack --ctstate INVALID' );
-  addto( $chain_in, '-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' );
+  make_log_chains( $ifkey, 'b' );
 
   # this is the kind of stuff we don't want to be in the log
   my $chain = $ifkey . '_silentdrop';
@@ -360,13 +361,22 @@ sub generic_physical_rules
     for my $n ( @{ $if->{ 'silent drop list' } } )
     {
       add_hostport_to( $chain, '-d', $n, '-j DROP' );
-    }
+    } 
+
+  make_rejects_chain( $if );
+  make_special_rules( $if );
 
   add_access_rules( $if );
 
+  # finalizing
   addto( $chain_in, '-j', $if->{ 'droplog chains' }->{ 'in' } ); # we want to see what's going on there
-
   addto( 'INPUT', '-i', $if->{ 'if name' }, '-j', $chain_in );
+
+  if( $chain_out ne '' )
+  {
+    addto( $chain_out, '-j', $if->{ 'droplog chains' }->{ 'out' } ); # we want to see what's going on there
+    addto( 'OUTPUT', '-o', $if->{ 'if name' }, '-j', $chain_out );
+  }
 }
 
 ###############################################################################
@@ -384,7 +394,7 @@ sub virtual_rules
   {
     make_chain( 'INPUT', $chain_in, '********* Virtual: ' . $chain_in . ' *******' );
     addto( $chain_in, '-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' );
-    log_it( $chain_in, '-INV', 'DROP', '-m conntrack --ctstate INVALID' );
+    log_it( $chain_in, 'INV', 'DROP', '-m conntrack --ctstate INVALID' );
 
     #for my $n ( @{ $if->{ 'silent drop list' } } )
     #{
@@ -396,7 +406,7 @@ sub virtual_rules
   {
     make_chain( 'OUTPUT', $chain_out, '********* Virtual: ' . $chain_out . ' *******' );
     addto( $chain_out, '-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' );
-    log_it( $chain_out, '-INV', 'DROP', '-m conntrack --ctstate INVALID' );
+    log_it( $chain_out, 'INV', 'DROP', '-m conntrack --ctstate INVALID' );
 
     #for my $n ( @{ $if->{ 'silent drop list' } } )
     #{
@@ -424,6 +434,85 @@ sub virtual_rules
     addto( 'OUTPUT', '-o', $if->{ 'if name' }, '-j', $chain_out );
   }
 }
+
+###############################################################################
+# block/reject obvious scans and some malformed stuff. No logging
+# split by portranges for statistical purposes
+# in: if hash
+sub make_rejects_chain
+{
+  my $if = $_[0];
+  return if ! exists( $if->{ 'incoming reject' } );
+
+  my $chain_in  = $if->{ 'chains' }->{ 'in' };
+  my $scans_chain = $if->{ 'alias' } . '_rej';
+
+  make_chain( $chain_in, $scans_chain );
+
+    for my $key ( keys %{ $if->{ 'incoming reject' } } )
+    {
+      my ( $proto, $method ) = split( ':', $key );
+
+      for my $ports ( @{ $if->{ 'incoming reject' }->{ $key } } )
+      {
+        addto( $scans_chain, '-p', $proto, '-m multiport --dports', $ports, '-j REJECT --reject-with', $method );
+      }
+    }
+} # make_rejects_chain()
+
+###############################################################################
+# makes rules for special categories in the iterface config:
+# 'incoming open', 'incoming open & log', 'incoming block & log'
+# in: if hash
+sub make_special_rules
+{
+  my $if = $_[0];
+  my $chain_in  = $if->{ 'chains' }->{ 'in' };
+
+  for my $category ( ( 'incoming open', 'incoming open & log', 'incoming block & log' ) )
+  {
+    next if ! exists( $if->{ $category } );
+
+    for my $proto ( qw~tcp udp~ )
+    {
+      my $list = $if->{ $category }->{ $proto };
+      next if $#$list == -1; # no specifics
+
+      for my $hp ( @$list )
+      {
+        my ($addr, @portlist );
+
+        $hp =~ /^([^:]+)(:(.+))?$/;
+        if ( defined( $2 ) )
+        {
+          $addr = '-s ' . $1;
+          @portlist = split( ',', $3 );
+        }
+        else
+        {
+          $addr = '';
+          @portlist = split( ',', $1 );
+        }
+
+        for my $port ( @portlist )
+        {
+          if ( $category eq 'incoming log' ) # log and ACCEPT
+          {
+            addto( $chain_in, $addr, '-p', $proto, '--dport', $port, $proto eq 'tcp' ? '-m conntrack --ctstate NEW' : '', '-j', $if->{ 'oklog chains' }->{ 'in' } );
+          }
+          elsif ( $category eq 'incoming note' ) # LOG and DROP
+          {
+            addto( $chain_in, $addr, '-p', $proto, '--dport', $port, '-j', $if->{ 'droplog chains' }->{ 'in' } );
+          }
+          else # open as is
+          {
+            addto( $chain_in, $addr, '-p', $proto, '--dport', $port, $proto eq 'tcp' ? '-m conntrack --ctstate NEW' : '', '-j ACCEPT'  );
+          }
+        } # portlist
+      } # addr:port
+    } # proto
+  } # category
+} # make_special_rules()
 
 ###############################################################################
 ############  Service procedures starting from here ###########################
@@ -570,7 +659,9 @@ sub dup_app_rules
 }
 
 ##########################################################################################
-# in: TAG, portlist string: port1,port2-port3,port4... [, bool: don't pack]
+# Used to parse freestyle config portlists coming as a modifier after the statemet:
+#   e.g. tcp:ports... logdrop:someports or quarantine:...
+# in: TAG, portlist string: port1,port2:port3,port4... [, bool: don't pack]
 # pack means combine ports in a way suitable for dense -m multiport
 # out: undef if empty or error
 #   [ 'port1', 'port2' ... ] if not packed
@@ -599,11 +690,12 @@ sub parse_portlist
   {
     if ( $p eq '+' || $p eq '-' || $p eq '*'  ) # global stuff comes separate
     {
+      $packit and croak "encountered wildcard with 'pack ports' option at $tag, $s";
       push @$o, $p;
       $count = 0;
     }
 
-    elsif ( $p =~ /^(\d+(:\d+)?|[a-z]\w+)$/ ) # port1[-:]portN or named port
+    elsif ( $p =~ /^(\d+(:\d+)?|[a-z]\w+)$/ ) # port1[:]portN or named port
     {
       my $places = defined( $2 ) ? 2 : 1;
 
@@ -633,6 +725,7 @@ sub parse_portlist
 }
 
 ##########################################################################################
+# parses APP (Address/Proto/Port) lists into existing proto->port tree
 #in: TAG, existing tree or undef, addr:proto:portlist;... list as a string
 #out: {tree} ref: {addr}->{proto}->[ports]
 sub parse_app_list
@@ -727,9 +820,11 @@ sub get_class_access_rules
     if ( grep( /^$r$/, ( 'boot', 'dhcp', 'drop bad tcp', 'limit scans', 'log bad tcp', 'rtsp', 'samba', 'quarantine' )) )
     {
       $rules->{ $r } = 1;
+
       next;
     }
 
+    #-----------------------
     if ( $r =~ /^logdrop(:(.+))?$/ )
     {
       my $p = parse_portlist( $tag, defined( $2 ) ? $2 : '0:1023' );
@@ -737,16 +832,18 @@ sub get_class_access_rules
       defined( $p ) or croak "Invalid portlist for logdrop: '$r'\n";
 
       $rules->{ 'logdrop' } = $p;
+
       next;
     }
 
+    #-----------------------
     if ( $r eq 'norestrict' ) # blank out all specific ports from parent list
     {
       for my $er ( keys %{ $rules } )
       {
-        if ( $er =~ /^(icmp|tcp|udp):/ )
+        if ( $er =~ /^(bcast|icmp|tcp|udp):/ )
         {
-          $er = '';
+          $rules->{ $er } = {};
         }
       }
 
@@ -760,6 +857,7 @@ sub get_class_access_rules
       next;
     }
 
+    #-----------------------
     if ( $r =~ /^(all|any|bcast|icmp|tcp|udp):(.+)/ ) # portlist follows the colon.
     {
       my $protocols = $1;
@@ -776,24 +874,32 @@ sub get_class_access_rules
       {
         for my $port ( @$portlist ) # we need non-packed list here
         {
+          my $allow_port = 1;
+
+          # OK. The parent may specify concrete allowed ports that is inherited.
+          # but we need to cross-check for bulk-to-specific and bulk-to-table_default
+          # and this is done when generating rules...
           if ( $port eq '+' || $port eq '*' || $port eq '-' ) # get rid of any of parent's specifics
-          {
-            $rules->{ $proto } = { };
-          }
-          else # specific port name or number
           {
             delete $rules->{ $proto }->{ '+' };
             delete $rules->{ $proto }->{ '-' };
             delete $rules->{ $proto }->{ '*' };
           }
 
-          $rules->{ $proto }->{ $port } = 1; # note for ICMP $port is type
+          elsif ( $port =~ /^!(.+)/ )
+          {
+            $port = $1;
+            $allow_port = 0;
+          }
+
+          $rules->{ $proto }->{ $port } = $allow_port; # note for ICMP $port is type
         } # for $port
       } # for $proto
 
       next;
-    } # if ( $r =~ /^(all|any|bcast|icmp|tcp|udp):(.+)/ ) # portlist follows the colon.
+    } # all|any|bcast|icmp|tcp|udp:(.+) # portlist follows the colon.
 
+    #-----------------------
     # internet: options: c - clients can, i - interface can. default is both can
     if ( $r =~ /^i-?net(:[cib])?/ )
     {
@@ -801,6 +907,7 @@ sub get_class_access_rules
       next;
     }
 
+    #-----------------------
     # allow/deny outgoing traffic from this interface. Used for quarantined virtuals
     if ( $r =~ /^(allowto|denyto):(.+)?/ )
     {
@@ -812,6 +919,27 @@ sub get_class_access_rules
 
     croak "!!! unknown access rule: '$r' !!!";
   } # foreach my $r ( @config_rules ) # getting parent's and own merged
+
+  # cleanup: get rid of port definitions that copy default ('+'/'-')
+  for my $proto ( qw(tcp udp bcast) )
+  {
+    my $plist = $rules->{ $proto };
+
+    next if ( exists( $plist->{ '*' } ) || ( ! exists( $plist->{ '-' } ) && ! exists( $plist->{ '+' } ) ) );
+
+    my $allow = exists( $plist->{ '+' } );
+
+    for my $port ( keys %$plist )
+    {
+      next if ( $port eq '-' || $port eq '+' );
+
+      if( ( $allow && $plist->{ $port } == 1 )
+        ||( ! $allow && $plist->{ $port } == 0 ) )
+      {
+         delete $plist->{ $port };
+      }
+    }
+  } # for proto
 
   print "\n";
 
@@ -836,15 +964,77 @@ sub port_sanity_check
 }
 
 ###############################################################################
-# in: interface ref, rules ref, address, chain name, specify source, is output chain
+# makes sorted array out of rule portlist, making more specific ports come first
+# to allow exceptions from broad rules: like allow ssh, but deny whole 0-1024 range
+# in: rules hash, proto name
+# out: ( [denied ports if any], [allowed ports if any] )
+sub make_ordered_portlist_sortfunc
+{
+  my @a = split /:/, $_[0];
+  my @b = split /:/, $_[1];
+
+  # easy cases:
+  my $c = $#a <=> $#b; # single or range?
+
+  $c != 0 and return $c; # one is single and other is range
+
+  if ( $#a == 0 && $#b == 0 ) # single ports - natural order
+  {
+    return $a[0] <=> $b[0];
+  }
+
+  $c = $a[0] <=> $b[0]; # for ranges we sort on lower bound if differ
+  $c != 0 and return $c;
+
+  # or upper bound
+  return $a[1] <=> $b[1];
+}
+
+#------------------------
+sub make_ordered_portlist
+{
+  my ( $r, $proto ) = @_;
+
+  my $proto_num = getprotobyname( $proto );
+
+  my $en = [];
+  my $dis = [];
+  my @out;
+
+
+  for my $k ( keys %$r )
+  {
+    my $num = $k;
+
+    if ( $k !~ /^\d+(:\d+)?$/ ) # non-numeric. resolving
+    {
+       my ( $s_name, $s_aliases, $num, $s_proto ) = getservbyname( $k, $proto );
+       defined( $num ) or croak "$proto:$k does not resolve!";
+    }
+
+    if ( $r->{ $k } == 1 )
+    {
+      push @$en, $num;
+    }
+    else
+    {
+      push @$dis, $num;
+    }
+  }
+
+  return ( [ sort make_ordered_portlist_sortfunc @$dis ], [ sort make_ordered_portlist_sortfunc @$en ] );
+}
+
+###############################################################################
+# in: interface ref, rules ref, address, chain name, { options }
 # parses clauses like 'tcp:23,ssh' and adds rules
 sub add_proto_ports_rules
 {
   my ( $if, $rules, $addr, $chain, $opts ) = @_;
 
-  $opts = make_complete_set( $opts, { 'dedicated chain' => 0, 'is output' => 0, 'external' => 0 } );
+  $opts = make_complete_set( $opts, { 'dedicated chain' => 0, 'is output' => 0 } );
 
-  my $src = ''; # for a host chain we skip using -s addr
+  my $src = ''; # for a dedicated host chain we skip using -s addr as it already filtered by
 
   if ( $addr ne '' && ! $opts->{ 'dedicated chain' } ) # non-dedicated chain: always need to specify address
   {
@@ -853,6 +1043,9 @@ sub add_proto_ports_rules
 
   my $chain_drop = $if->{ 'droplog chains' }->{ $opts->{ 'is output' } ? 'out' : 'in' };
 
+  $debug and print "+++ add_proto_ports_rules(): src: '$src', chain: '$chain', addr: '$addr', if: ", $if->{ 'alias' }, "\n";
+
+  # going through each protocol:
   for my $config_proto ( qw~bcast icmp tcp udp~ )
   {
     my @port_list = ([]); # pack together to optimize via -m multiport
@@ -872,7 +1065,11 @@ sub add_proto_ports_rules
 
     for my $port ( keys %{ $rules->{ $config_proto } } )
     {
+      next if ( $port eq '-' || $port eq '+' || $port eq '*' );
+
       port_sanity_check( $if, $config_proto, $port );
+
+      my $allow_mode = $rules->{ $config_proto }->{ $port };
 
       my $places = ( $port =~ /:/ ? 2 : 1 );
 
@@ -887,101 +1084,96 @@ sub add_proto_ports_rules
       $mp_count += $places;
     }
 
-    next if ( $#port_list == 0 && $#{ $port_list[0] } == -1 ); # no specifics for this protocol
+    #-----------------------------
+    my @dst_ips;
 
-    for my $port_set ( @port_list )
+    if ( $config_proto eq 'bcast' )
     {
-      my @dst_ips;
+      @dst_ips = ( '224.0.0.0/4', # 224.0.0.0 ~ 239.255.255.255 reserved for multicast addresses. RFC 3171
+                   '240.0.0.0/4', # reserved (former Class E network) RFC 1700
+                   #'255.255.255.255', # is the limited broadcast address (limited to all other nodes on the LAN) RFC 919
+                 );
+    }
 
-      if ( $config_proto eq 'bcast' )
+    elsif( exists $opts->{ 'index' } ) # ruleset w defaults for a network - use specified destination ip
+    {
+      @dst_ips = ( $if->{ 'ip4 addr' }->[ $opts->{ 'index' } ] );
+    }
+
+    else # dedicated host chain case - listing all interface ips
+    {
+      @dst_ips = ( @{ $if->{ 'ip4 addr' } } );
+    }
+
+    #-----------------------------
+    # for each of destination addresses
+    for my $ipno ( 0..$#dst_ips )
+    {
+      my $dst = $dst_ips[ $ipno ];
+      my $from_to;
+
+      $from_to = $src . ' -d ' . $dst;
+
+      for my $port_set ( @port_list )
       {
-        @dst_ips = ( '224.0.0.0/4', # 224.0.0.0 ~ 239.255.255.255 reserved for multicast addresses. RFC 3171
-                     '240.0.0.0/4', # reserved (former Class E network) RFC 1700
-                     #'255.255.255.255', # is the limited broadcast address (limited to all other nodes on the LAN) RFC 919
-                   );
+        next if $#$port_set == -1; # there are no ports in config really, but there may be default left, so we continue
+
+        my $port = $#{ $port_set } == 0 ? '--dport ' . $port_set->[ 0 ] : '-m multiport --dports ' . join( ',', @$port_set );
+
+        if ( $real_proto eq 'icmp' )
+        {
+          addto( $chain, $from_to, '-p icmp --icmp-type', $port, '-j ACCEPT' );
+        }
+        else
+        {
+          addto( $chain, $from_to, '-p', $real_proto, $port, '-j ACCEPT' );
+        }
+      } # for my $port_set
+
+      # processing default if any
+
+      $debug and print "------- ip# $ipno, fromto '$from_to', dst: '$dst', realp: '$real_proto', cfp: '$config_proto'\n";
+
+      if ( exists( $rules->{ $config_proto }->{ '+' } ) ) # no restrictions on i-face + forwarding.
+      {
+        addto( $chain, $from_to, '-p', $real_proto, '-j ACCEPT' );
+        addto( 'FORWARD', '-i', $if->{ 'if name' }, '-s', $addr, '-p', $real_proto, '-j ACCEPT' );
       }
 
-      elsif( exists $opts->{ 'index' } ) # ruleset w defaults for a network - use specified destination ip
+      elsif ( exists( $rules->{ $config_proto }->{ '*' } ) ) # in: relaxed access to our iface. out: net scope only
       {
-        @dst_ips = ( $if->{ 'ip4 addr' }->[ $opts->{ 'index' } ] );
+        addto( $chain, $from_to, '-p', $real_proto, '-j ACCEPT' );
       }
 
-      else # dedicated host chain case - listing all interface ips
+      elsif ( exists( $rules->{ $config_proto }->{ '-' } ) ) # drop him!
       {
-        @dst_ips = ( @{ $if->{ 'ip4 addr' } } );
-      }
-
-      # for each of interface address
-      for my $ipno ( 0..$#dst_ips )
-      {
-        my $dst = $dst_ips[ $ipno ];
-        my $from_to;
-
-        if ( $opts->{ 'external' } )
+        if ( exists( $rules->{ 'logdrop' } ) )
         {
-          $from_to = $src . ' -d ' . $dst;
-        }
-        else # interface output
-        {
-          $from_to = $src;
-        }
-
-        # no restrictions on i-face + forwarding.
-        if ( $port_set->[0] eq '+' )
-        {
-          addto( $chain, $from_to, '-p', $real_proto, '-j ACCEPT' );
-          addto( 'FORWARD', '-i', $if->{ 'if name' }, '-s', $addr, '-p', $real_proto, '-j ACCEPT' );
-        }
-
-        elsif ( $port_set->[0] eq '*' ) # in: relaxed access to our iface. out: net scope only
-        {
-          addto( $chain, $from_to, '-p', $real_proto, '-j ACCEPT' );
-        }
-
-        elsif ( $port_set->[0] eq '-' ) # drop him!
-        {
-          if ( exists( $rules->{ 'logdrop' } ) )
+          if ( $real_proto eq 'icmp' )
           {
-            if ( $real_proto eq 'icmp' )
-            {
-              addto( $chain, $from_to, '-p icmp -j', $chain_drop );
-            }
-            else
-            {
-              dup_rule( [ $rules->{ 'logdrop' } ], $chain, $from_to, '-p', $real_proto, '-m multiport --dports %1', '-j', $chain_drop );
-            }
+            addto( $chain, $from_to, '-p icmp -j', $chain_drop );
           }
-
-          addto( $chain, $from_to, '-p', $real_proto, '-j DROP' );
+          else
+          {
+            dup_rule( [ $rules->{ 'logdrop' } ], $chain, $from_to, '-p', $real_proto, '-m multiport --dports %1', '-j', $chain_drop );
+          }
         }
 
-        else # very specific ports/icmp types
-        {
-           my $port = $#{ $port_set } == 0 ? '--dport ' . $port_set->[0] : '-m multiport --dports ' . join( ',', @$port_set );
-
-           if ( $real_proto eq 'icmp' )
-           {
-             addto( $chain, $from_to, '-p icmp --icmp-type', $port, '-j ACCEPT' );
-           }
-           else
-           {
-             addto( $chain, $from_to, '-p', $real_proto, $port, '-j ACCEPT' );
-           }
-        }
-      } # for my $ipno
-    } # for my $port_set
+        addto( $chain, $from_to, '-p', $real_proto, '-j DROP' );
+      }
+    } # for my $ipno
   } # for $config_proto
 } # sub add_proto_ports_rules
 
 ###############################################################################
 # construct actual filetering rules. used as for defaults and as a per host config
 # parms: if hashref, rules hash ref, address to make for, base chain name
-# opts href: { 'dedicated chain' => bool - no need in -s addr, 'is output' => bool - output chain, 'external' => bool - rules for client on the net }
+# opts href: { 'dedicated chain' => bool - no need in -s addr, 'is output' => bool - output chain }
 # return: none
 sub add_ruleset
 {
   my ( $if, $rules, $chain, $addr, $opts ) = @_;
-  $opts = make_complete_set( $opts, { 'dedicated chain' => 0, 'is output' => 0, 'external' => 0 } );
+  $opts = make_complete_set( $opts, { 'dedicated chain' => 0, 'is output' => 0 } );
 
   my $src = ''; # for a host chain we skip using -s addr
   my $same_net; # netmask. used for enabling specific client's broadcasts like for samba
@@ -994,10 +1186,15 @@ sub add_ruleset
     $src = '-s ' . $addr;
   }
 
-  #print "\n + adding ruleset for address '$addr', if: ", $if->{'alias'}, ", dest chain: $chain\n";
-  #print '     rule keys: ', join(', ', keys %{$rules}), "\n";
+  if( $debug )
+  {
+    print "\n+ adding ruleset for address '$addr', if: ", $if->{'alias'}, ", dest chain: $chain
+      rule keys: ", join(', ', keys %{$rules}), "\n\t";
+    for my $k ( keys %$opts ){ print "$k: $opts->{$k}, "; }
+    print "\n";
+  }
 
-  if ( $opts->{ 'external' } ) # external network hosts: incoming to this interface
+  if ( ! $opts->{ 'is output' } ) # external network hosts: incoming to this interface
   {
     if ( $opts->{ 'dedicated chain' } )
     {
@@ -1017,8 +1214,8 @@ sub add_ruleset
 
         if ( $if->{ 'ip4 bcast' }->[ $n ] eq $s )
         {
-           $same_net = $if->{ 'ip4 net' }->[ $n ];
-           last;
+          $same_net = $if->{ 'ip4 net' }->[ $n ];
+          last;
         }
       }
     }
@@ -1055,10 +1252,10 @@ sub add_ruleset
 
     if ( exists $rules->{ 'samba' } && defined( $same_net ) ) # we need this to enable not only direct access, but a little broadcast too
     {
-       addto( $chain, $src, '-p tcp -d', $same_net, '-m multiport --dports 137:139,445 -j ACCEPT' ); # same net
-       addto( $chain, $src, '-p udp -d', $same_net, '-m multiport --dports 137:139,445 -j ACCEPT' ); # same net
+      addto( $chain, $src, '-p tcp -d', $same_net, '-m multiport --dports 137:139,445 -j ACCEPT' ); # same net
+      addto( $chain, $src, '-p udp -d', $same_net, '-m multiport --dports 137:139,445 -j ACCEPT' ); # same net
     }
-  } # if ( $opt->{ 'external' } )
+  } # if input
 
   ################ global rules:
 
@@ -1084,50 +1281,42 @@ sub add_ruleset
     }
   } # i-net
 
-  if ( exists $rules->{ 'norestrict' } )
-  {
-    addto( $chain, '-o', $if->{ 'if name' }, '-s', $addr, '-m conntrack --ctstate NEW -j ACCEPT' );
-    addto( $chain, $src, '-j ACCEPT' );
-    addto( 'FORWARD', '-i', $if->{ 'if name' }, '-s', $addr, '-j ACCEPT' );
-    return; # nothing more to do ;)
-  }
+  add_proto_ports_rules( $if, $rules, $addr, $chain, $opts ); # should come before norestrict to add exceptions if any
 
   if ( exists $rules->{ 'rtsp' } )
   {
   }
 
-  add_proto_ports_rules( $if, $rules, $addr, $chain, $opts );
-
-  if ( ! $opts->{ 'external' } ) #interface's own
+  if ( exists $rules->{ 'norestrict' } )
   {
-    if ( $opts->{ 'is output' } )
+    addto( $chain, $src, '-m conntrack --ctstate NEW -j ACCEPT' );
+    addto( 'FORWARD', '-i', $if->{ 'if name' }, '-s', $addr, '-j ACCEPT' );
+    return; # nothing more to do ;)
+  }
+
+  if ( $opts->{ 'is output' } )
+  {
+    if ( exists $rules->{ 'quarantine' } ) # before quarantine allow inside trafiic
     {
-      if ( exists $rules->{ 'quarantine' } ) # before quarantine allow inside trafiic
+      for my $n1 ( 0..$#{ $if->{ 'ip4 net' } } ) # for each of interface nets: allowing traffic inbetween first
       {
-        for my $n1 ( 0..$#{ $if->{ 'ip4 net' } } ) # for each of interface nets: allowing traffic inbetween first
+        addto( $chain, '-s', $if->{ 'ip4 net' }->[ $n1 ], '-d', $if->{ 'ip4 net' }->[ $n1 ], '-j ACCEPT' ); # same net
+
+        my $n2 = $n1 + 1;
+        while( $n2 <= $#{ $if->{ 'ip4 net' } } )
         {
-          addto( $chain, '-s', $if->{ 'ip4 net' }->[$n1], '-d', $if->{ 'ip4 net' }->[$n1], '-j ACCEPT' ); # same net
-
-          my $n2 = $n1 + 1;
-          while( $n2 <= $#{ $if->{ 'ip4 net' } } )
-          {
-            addto( $chain, '-s', $if->{ 'ip4 net' }->[$n1], '-d', $if->{ 'ip4 net' }->[$n2], '-j ACCEPT' ); # same net
-            addto( $chain, '-s', $if->{ 'ip4 net' }->[$n2], '-d', $if->{ 'ip4 net' }->[$n1], '-j ACCEPT' ); # same net
-            ++$n2;
-          }
+          addto( $chain, '-s', $if->{ 'ip4 net' }->[ $n1 ], '-d', $if->{ 'ip4 net' }->[ $n2 ], '-j ACCEPT' ); # same net
+          addto( $chain, '-s', $if->{ 'ip4 net' }->[ $n2 ], '-d', $if->{ 'ip4 net' }->[ $n1 ], '-j ACCEPT' ); # same net
+          ++$n2;
         }
-      } # if quarantine
-    } # if output
-
-    else # input to if
-    {
-    } # input to if
+      }
+    } # if quarantine
 
     if ( exists $rules->{ 'allowto' } )
     {
       dup_app_rules( $rules->{ 'allowto' }, $if->{ 'chains' }->{ 'out' }, '-d %1 -p %2 --dport %3 -j ACCEPT' );
     }
-  } # if ! external
+  } # if output
 
   if ( exists $rules->{ 'logdrop' } ) # this should be the last
   {
@@ -1135,30 +1324,27 @@ sub add_ruleset
     dup_rule( [ $rules->{ 'logdrop' } ], $chain, $src, '-p udp -m multiport --dports %1', '-j', $if->{ 'droplog chains' }->{ $opts->{ 'is output' } ? 'out' : 'in' } );
   }
 
-  if ( ! $opts->{ 'external' } ) # interface's own OUTPUT rules:
+  if ( $opts->{ 'is output' } )
   {
-    if ( $opts->{ 'is output' } )
+    if ( exists $rules->{ 'quarantine' } ) # block all other output from this interface's ip
     {
-      if ( exists $rules->{ 'quarantine' } ) # block all other output from this interface's ip
+      if ( exists $rules->{ 'i-net' } ) # locking out local nets and passing all other through.
       {
-        if ( exists $rules->{ 'i-net' } ) # locking out local nets and passing all other through.
+        for my $d ( drop_destinations( $if->{ 'alias' } ) )
         {
-          for my $d ( drop_destinations( $if->{ 'alias' } ) )
-          {
-            addto( $chain, '-d', $d, '-j DROP' );
-          }
+          addto( $chain, '-d', $d, '-j DROP' );
+        }
 
-          addto( $chain, '-j ACCEPT' );
-        }
-        else # no i-net - dropping all
-        {
-          addto( $chain, '-s', $addr, '-j DROP' );
-        }
+        addto( $chain, '-j ACCEPT' );
       }
-      elsif ( exists $rules->{ 'denyto' } ) # or... there are some other restrictions
+      else # no i-net - dropping all
       {
-        dup_app_rules( $rules->{ 'denyto' }, $if->{ 'chains' }->{ 'out' }, '-d %1 -p %2 --dport %3 -j DROP' );
+        addto( $chain, '-s', $addr, '-j DROP' );
       }
+    }
+    elsif ( exists $rules->{ 'denyto' } ) # or... there are some other restrictions
+    {
+      dup_app_rules( $rules->{ 'denyto' }, $if->{ 'chains' }->{ 'out' }, '-d %1 -p %2 --dport %3 -j DROP' );
     }
   } # iface own rules
 
@@ -1211,21 +1397,30 @@ sub add_access_rules
   # unknowns processed later
   if ( $host_list ) # we have per-host rules there
   {
-    #my $mism_mac_chain = $ifalias . $common_chains->{ 'mismatched mac' };
-    #make_chain( $chain_in, $mism_mac_chain );
-    #  addto( $mism_mac_chain, '-j LOG --log-level info --log-prefix', '"ipt4-' . $ifalias . ' MAC+,IP-" ' );
-    #  addto( $mismm_mac_chain, '-j DROP' );
-
     my $mism_ip_chain = $ifalias . $common_chains->{ 'mismatched ip' };
     make_chain( $chain_in, $mism_ip_chain );
-      addto( $mism_ip_chain, '-j LOG --log-level info --log-prefix', '"ipt4-' . $ifalias . ' MAC-,IP+" ' );
+      addto( $mism_ip_chain, '-j LOG --log-level info --log-prefix', '"ipt4-' . $ifalias . ' MAC+,IP- " ' );
       addto( $mism_ip_chain, '-j DROP' );
 
     # HOSTS:
     # adding individual host's rules. make it diff-friendly sorted
     for my $host ( sort( keys %{ $host_list } ) )
     {
-      gethostbyname $host or croak "!!! Host doesn't resolve: '$host' !!!";
+      my $client = { # initialize additional host info for subsequent function calls
+        'name' => $host, # main name by which it will be called in script
+        #'match_ic' => [ 'clients address #1,address2', ...], # this will match interface's net on order to client's addresses
+        #'match_ci' => { 'clients address #1' => interface's "ip4*" index, ... }
+        'd2i' => {},   # domain -> ip
+        'i2d' => {},   # reverse: ip -> domain
+        'all_nets' => {},   # network specifications for each domain and ip
+        'all_masks' => {},  # mask for each domain and ip
+        'all_bcasts' => {}, # broadcast address for each domain and ip
+        #'rules' => {}, # rules. assigned later
+        #'' => {}, # 
+      };
+
+      my ( $name, $aliases, $addrtype, $length, @addrs ) = gethostbyname( $host );
+      $name or croak "!!! Host doesn't resolve: '$host' at " . $if->{ 'aslias' } . "!!!";
 
       my $rules = get_class_access_rules( $host_list->{ $host }->[1] );
       my $ports_chain = $if->{ 'alias' } . $common_chains->{ 'host prefix' } . $host;
@@ -1234,7 +1429,7 @@ sub add_access_rules
 
       addto( $chain_in, '-m mac --mac-source', $acc->{ 'hosts' }->{ $host }->[0], '-j', $ports_chain );
 
-      add_ruleset( $if, $rules, $ports_chain, $host, { 'dedicated chain' => 1, 'is output' => 0, 'external' => 1 } );
+      add_ruleset( $if, $rules, $ports_chain, $host, { 'dedicated chain' => 1, 'is output' => 0 } );
     } # for my $host
   } # if $host_list
 
@@ -1281,8 +1476,10 @@ sub add_access_rules
       addto( $chain_in, '-j', $chain );
     } # limit scans
 
-    add_ruleset( $if, $r, $chain_in, $if->{ 'ip4 net' }->[ $i ], { 'index' => $i, 'dedicated chain' => 0, 'is output' => 0, 'external' => 1 } );
+    #----------------------
+    add_ruleset( $if, $r, $chain_in, $if->{ 'ip4 net' }->[ $i ], { 'index' => $i, 'dedicated chain' => 0, 'is output' => 0 } );
 
+    #----------------------
     # interface's own rules:
     if ( $if->{ 'chains' }->{ 'out' } ne '' ) # out chain name set, so rules must be applied
     {
@@ -1292,7 +1489,12 @@ sub add_access_rules
 
       $r = get_class_access_rules( $if->{ 'ip4 interface class' }->[ $i ] );
 
-      add_ruleset( $if, $r, $ch, $if->{ 'ip4 addr' }->[ $i ], { 'index' => $i, 'dedicated chain' => 1, 'is output' => 1, 'external' => 0 } );
+      add_ruleset( $if, $r, $ch, $if->{ 'ip4 addr' }->[ $i ], { 'index' => $i, 'dedicated chain' => 0, 'is output' => 1 } );
+    }
+
+    elsif( exists( $if->{ 'ip4 interface class' } ) && $#{ $if->{ 'ip4 interface class' } } > -1 )
+    {
+       croak "!ERROR: if " . $if->{ 'alias' } . ' out chain name is NOT set, but interface has class assigned';
     }
   } # for my $i ( 0..$#{ $if->{ 'ip4 net' } } ) # for each of interface nets
 } # sub add_access_rules()
@@ -1354,7 +1556,7 @@ sub table_flush
   #}
 
   # flushing standard chains trees
-  for $chain ( keys %{ $tables{ $current_table }->{ 'defaults' }} )
+  for $chain ( sort( keys %{ $tables{ $current_table }->{ 'defaults' } } ) )
   {
     print $out_file "\n\n", '#'x30, "\n";
     chain_flush( $current_table . ':' . $chain );
@@ -1413,14 +1615,25 @@ sub put_comment_lines
 sub log_it
 {
   my ( $owner, $suffix, $action, @rule ) = @_;
-  my $chain = $owner . '_log_' . $suffix;
+  my $chain = $owner . '_log';
+
+  if ( $suffix and $suffix ne '' )
+  {
+    $chain .= '_' . $suffix;
+    $suffix = $owner . '-' . $suffix;
+  }
+  else
+  {
+    $suffix = $owner;
+  }
 
   my ( undef, $chain_q ) = qualify_chain_name( $chain );
+
   if ( ! exists $chains{ $chain_q } ) # making new chain
   {
     make_chain( $owner, $chain );
 
-    addto( $chain, '-j LOG --log-level info --log-prefix "ipt4-' . $suffix . ': "' );
+    addto( $chain, '-j LOG --log-level info --log-prefix "ipt4-' . $suffix . ' "' );
     addto( $chain, '-j', $action );
   }
 
@@ -1455,14 +1668,15 @@ sub make_log_chains
   {
     my $parent = $parents->{ $io };
 
-#print " . make log chains(): io: $io, parent: '$parent'\n";
+    $debug and print " . make log chains(): io: $io, parent: '$parent'\n";
     next if ( $parent eq '' );
 
     $prefix = $parent;# . '_' . $name;
     my $drop = "${prefix}_log_drop";
     my $ok   = "${prefix}_ok_log";
 
-#print "\t\tdrop: '$drop', ok: '$ok'\n";
+    $debug and print "\t\tdrop: '$drop', ok: '$ok'\n";
+
     if ( $if )
     {
       $if->{ 'droplog chains' }->{ $io } = $drop;
@@ -1544,7 +1758,15 @@ sub addto
 #    $r =~ s/-j ACCEPT/-m conntrack --ctstate NEW -j ACCEPT/;
 #  }
 
-  push @{ $chains{ $chain }->[0] }, '  -A ' . $barechain . $r;
+  my $s = '  -A ' . $barechain . $r;
+
+  # avoiding dups
+  for my $existing ( @{ $chains{ $chain }->[0] } )
+  {
+    return if $s eq $existing;
+  }
+
+  push @{ $chains{ $chain }->[0] }, $s;
 }
 
 ##########################################################################################
@@ -1553,6 +1775,7 @@ sub make_chain
 {
   my (undef, $parent) = qualify_chain_name( shift @_ );
   my ($barechain, $chain) = qualify_chain_name( shift @_ );
+
   exists $chains{ $chain } and croak "Attempt to re-create chain '$chain'";
   exists $chains{ $parent } or croak "No parent '$parent' for new chain '$chain'";
 
@@ -1577,11 +1800,16 @@ sub make_chain
 sub qualify_chain_name
 {
   my $s = $_[0];
-  defined($s) or croak "!!! undef as chain name? !!!";
+
+  defined( $s ) or croak "!!! undef as chain name? !!!";
+
   my @n = ( $s, $s );
+
   $n[0] =~ s/^.+://;
   $n[1] =~ /:/ or $n[1] = $current_table . ':' . $n[1];
-  #print STDERR "q> '$n[0]' / '$n[1]'\n";
+
+  $debug and print "q> '$n[0]' / '$n[1]'\n";
+
   return @n;
 }
 
@@ -1815,7 +2043,7 @@ sub scan_if
 
     if ( $net_interfaces{ $ni }->{ 'options' }->{ 'volatile' } )
     {
-      print "!!! Volatile interface is not active now: $ni\n";
+      print "NOTE: Volatile interface is NOT ACTIVE now: $ni\n";
       # filling by the heart then
       $if = $net_interfaces{ $ni };
       $if->{ 'alias' } = $ni; # for reverse ref
@@ -1825,10 +2053,22 @@ sub scan_if
       $if->{ 'up' } = 0;
       $if->{ 'default' } = 0;
     }
+
+    elsif( ! $net_interfaces{ $ni }->{ 'options' }->{ 'enabled' } )
+    {
+      print "NOTE: DISABLED interface: $ni\n";
+      $if = $net_interfaces{ $ni };
+      $if->{ 'alias' } = $ni; # for reverse ref
+      $if->{ 'if type' } = 'DISABLED';
+      $if->{ 'if name' } = $ni;
+      $if->{ 'attr' } = '';
+      $if->{ 'up' } = 0;
+      $if->{ 'default' } = 0;
+    }
     else
     {
       ++$missed;
-      print "!!! No such interface: $ni\n";
+      print "!!! ERROR: No such interface: $ni\n";
     }
   }
 
