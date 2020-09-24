@@ -369,7 +369,7 @@ sub generic_physical_rules
   add_access_rules( $if );
 
   # finalizing
-  addto( $chain_in, '-j', $if->{ 'droplog chains' }->{ 'in' } ); # we want to see what's going on there
+  addto( $chain_in, '-j', $tables{ 'filter' }->{ 'defaults' }->{ 'INPUT' } ); # we want to enforce and be able to see the counters
   addto( 'INPUT', '-i', $if->{ 'if name' }, '-j', $chain_in );
 
   if( $chain_out ne '' )
@@ -695,7 +695,7 @@ sub parse_portlist
       $count = 0;
     }
 
-    elsif ( $p =~ /^(\d+(:\d+)?|[a-z]\w+)$/ ) # port1[:]portN or named port
+    elsif ( $p =~ /^(\d+(:\d+)?|[a-z]\w+(-\w+)?)$/ ) # port1[:]portN or named port
     {
       my $places = defined( $2 ) ? 2 : 1;
 
@@ -954,7 +954,7 @@ sub port_sanity_check
   my ( $if, $proto, $port ) = @_;
 
   if ( ( $port eq '+' ) || ( $port eq '*' ) || ( $port eq '-' )
-       || ( $port =~ /^\d+$/ ) || ( $port =~ /^[a-z]\w+$/ ) || ( $port =~ /^\d+:\d+$/ )
+       || ( $port =~ /^\d+$/ ) || ( $port =~ /^[a-z]\w+(-\w+)?$/ ) || ( $port =~ /^\d+:\d+$/ )
      )
   {
     return;
@@ -1085,19 +1085,20 @@ sub add_proto_ports_rules
     }
 
     #-----------------------------
+    my @bc_list = ( '224.0.0.0/4', # 224.0.0.0 ~ 239.255.255.255 reserved for multicast addresses. RFC 3171
+                   '240.0.0.0/4', # reserved (former Class E network) RFC 1700
+                 );
     my @dst_ips;
 
     if ( $config_proto eq 'bcast' )
     {
-      @dst_ips = ( '224.0.0.0/4', # 224.0.0.0 ~ 239.255.255.255 reserved for multicast addresses. RFC 3171
-                   '240.0.0.0/4', # reserved (former Class E network) RFC 1700
-                   #'255.255.255.255', # is the limited broadcast address (limited to all other nodes on the LAN) RFC 919
-                 );
+      @dst_ips = @bc_list;
     }
 
-    elsif( exists $opts->{ 'index' } ) # ruleset w defaults for a network - use specified destination ip
+    elsif( exists $opts->{ 'index' } ) # ruleset w defaults for a network - use specified destination ips
     {
-      @dst_ips = ( $if->{ 'ip4 addr' }->[ $opts->{ 'index' } ] );
+      push @dst_ips, ( $if->{ 'ip4 net' }->[ $opts->{ 'index' } ] ); # using nets to process network-wide broadcasts
+      push @dst_ips, '255.255.255.255'; # is the limited broadcast address (limited to all other nodes on the LAN) RFC 919
     }
 
     else # dedicated host chain case - listing all interface ips
@@ -1265,10 +1266,10 @@ sub add_ruleset
 
     my $mode = $rules->{ 'i-net' }; # (c)lient/(s)erver/(b)oth
 
-    #if ( $inet and $default_if == $inet ) # if we're not directly connected to inet then NAT will provided somewhere else
-    #{
+    if ( ! $opts->{ 'is output' } ) # not for local interfaces
+    {
       addto( 'nat:POSTROUTING', '-o', $default_if->{ 'if name' }, '-s', $addr, '-j SNAT --to-source', $default_if->{ 'ip4 addr' }->[0] );
-    #}
+    }
 
     if ( ! exists $rules->{ 'norestrict' } ) # don't duplicate
     {
@@ -1468,10 +1469,22 @@ sub add_access_rules
         $if->{ 'chains' }->{ 'limit scans' } = $chain;
       }
 
+      addto( $chain, '-p udp -j RETURN' );
+
       addto( $chain, '-p tcp --tcp-flags SYN,ACK,FIN,RST RST -m limit --limit 1/m -j RETURN' );
+      addto( $chain, '-p tcp ! --tcp-flags SYN,ACK,FIN,RST RST -j RETURN' );
+
       addto( $chain, '-p icmp --icmp-type  8 -m limit --limit 10/m -j ACCEPT' );
       addto( $chain, '-p icmp --icmp-type 11 -m limit --limit 10/m -j ACCEPT' );
-      log_it( $chain, '', 'DROP', '' );
+
+      if ( exists( $r->{ 'logdrop' } ) )
+      {
+        log_it( $chain, '', 'DROP', '-p tcp -m limit --limit 10/m -m multiport --dports ', join(',' , @{ $r->{ 'logdrop' } } ) );
+        log_it( $chain, '', 'DROP', '-p icmp -m limit --limit 1/m' );
+      }
+
+      # kill the rest silently
+      addto( $chain, '-j DROP' );
 
       addto( $chain_in, '-j', $chain );
     } # limit scans
