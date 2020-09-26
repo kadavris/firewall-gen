@@ -1266,16 +1266,26 @@ sub add_ruleset
 
     my $mode = $rules->{ 'i-net' }; # (c)lient/(s)erver/(b)oth
 
-    if ( ! $opts->{ 'is output' } ) # not for local interfaces
+    if ( ! $opts->{ 'is output' } ) # not for local interfaces: clients or network defaults
     {
-      addto( 'nat:POSTROUTING', '-o', $default_if->{ 'if name' }, '-s', $addr, '-j SNAT --to-source', $default_if->{ 'ip4 addr' }->[0] );
+      # a trick for alias ip on the default interface - no SNAT, meaning
+      # when we process default interface secondary alias NETWORK
+      # we skip SNAT for this secondary alias IP, so it is not mangled inside network itself
+      if ( exists( $opts->{ 'index' } ) && $opts->{ 'index' } > 0 && $default_if == $if )
+      {
+        addto( 'nat:POSTROUTING', 1, '-o', $default_if->{ 'if name' }, '-s', $if->{ 'ip4 addr' }->[ $opts->{ 'index' } ], '-j RETURN' );
+      }
+      else
+      {
+        addto( 'nat:POSTROUTING', '-o', $default_if->{ 'if name' }, '-s', $addr, '-j SNAT --to-source', $default_if->{ 'ip4 addr' }->[0] );
+      }
     }
 
     if ( ! exists $rules->{ 'norestrict' } ) # don't duplicate
     {
       addto( $chain, $src, '-o', $default_if->{ 'if name' }, '-j ACCEPT' );
 
-      if ( $default_if and $default_if != $if ) # in case of missing/disabled inet if
+      if ( $default_if != $if ) # in case of missing/disabled inet if
       {
         addto( 'FORWARD', '-i', $if->{ 'if name' }, '-s', $addr, '-o', $default_if->{ 'if name' }, '-j ACCEPT' );
       }
@@ -1741,14 +1751,21 @@ sub add_hostport_to
 # in: 'chain name', args
 sub addto
 {
-  check_args('addto', @_);
+  check_args( 'addto', @_ );
   my ($barechain, $chain) = qualify_chain_name( shift @_ );
 
   exists $chains{ $chain } or croak "Non-existent chain '$chain', adding: '" . join(' ', @_) . "'";
 
   @_ or croak "invalid call to addto() with: '$chain'";
 
-  my $r = join(' ', @_);
+  my $ins_mode = -1; # append by default
+
+  if ( '' . $_[0] =~ /^\d+$/ ) # 1st arg is a bare number - go insert mode
+  {
+    $ins_mode = shift @_;
+  }
+
+  my $r = join( ' ', @_ );
   $r =~ s/\s\s+/ /g; # compact it
   $r =~ s/^\s*/ /g;
 
@@ -1771,15 +1788,15 @@ sub addto
 #    $r =~ s/-j ACCEPT/-m conntrack --ctstate NEW -j ACCEPT/;
 #  }
 
-  my $s = '  -A ' . $barechain . $r;
+  my $s = '  -' . ( $ins_mode == -1 ? 'A' : 'I' ) . ' ' . $barechain . ( $ins_mode > -1 ? ' ' . $ins_mode : '' ) . $r;
 
   # avoiding dups
-  for my $existing ( @{ $chains{ $chain }->[0] } )
+  for my $existing ( @{ $chains{ $chain }->[ 0 ] } )
   {
     return if $s eq $existing;
   }
 
-  push @{ $chains{ $chain }->[0] }, $s;
+  push @{ $chains{ $chain }->[ 0 ] }, $s;
 }
 
 ##########################################################################################
