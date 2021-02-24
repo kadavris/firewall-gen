@@ -20,6 +20,7 @@ our %classes; # access rules
 
 our $debug = 0;
 our $verboseness = 3; # at zero show minimal info needed to confirm what's done
+our $test_mode = 0; # dry run. no saving of rules
 
 my $errors_count;   # will not load new config if any
 my $warnings_count; # da same
@@ -43,12 +44,13 @@ require 'firewall4-gen-inet_rules.pl';
 ##########################################################
 GetOptions(
   'd' => \$debug,
+  't' => \$test_mode,
   'v=i' => \$verboseness,
 );
 
 if( $verboseness > 0 )
 {
-  print "Firewall rules generation tool. V$version\nMade my Andrej Pakhutin (pakhutin<at>gmail)\n";
+  print "Firewall rules generation tool. V$version\nMade by Andrej Pakhutin (pakhutin<at>gmail)\n";
   print "Repository is at https://github.com/kadavris\n";
 }
 
@@ -97,7 +99,14 @@ my $lan  = $net_interfaces{ 'lan'  }; # This interface is assumed to be most sec
 my $inet = $net_interfaces{ 'inet' }; # internet. if any
 
 my $out_file;
-open $out_file, '>', $save_file or die "$save_file: $!";
+if ( $test_mode )
+{
+  open ( $out_file, ">&", \*STDERR ) or die "Can't dup STDERR: $!";
+}
+else
+{
+  open ( $out_file, '>', $save_file ) or die "$save_file: $!";
+}
 
 ######################################
 table_start( 'filter' );
@@ -925,6 +934,12 @@ sub add_proto_ports_rules
           }
         }
 
+        # for dhcp to work with broadcasts disabled we need to allow a bit:
+        if ( $opts->{ 'is output' } && $config_proto eq 'bcast' && exists( $rules->{ 'dhcp' } ) )
+        {
+          addto( $chain, $src, '-p udp -d 255.255.255.255 -j ACCEPT' );
+        }
+
         addto( $chain, $from_to, '-p', $real_proto, '-j DROP' );
       }
     } # for my $ipno
@@ -938,8 +953,10 @@ sub add_proto_ports_rules
 # return: none
 sub add_ruleset
 {
-  my ( $if, $rules, $chain, $addr, $opts ) = @_;
+  my ( $if, $rules, $chain, $cfg_addr, $opts ) = @_;
   $opts = make_complete_set( $opts, { 'dedicated chain' => 0, 'is output' => 0 } );
+  my $addr = $cfg_addr; # might be real IP for final output, if needed.
+
 
   my $src = ''; # for a host chain we skip using -s addr
   my $same_net; # netmask. used for enabling specific client's broadcasts like for samba
@@ -947,9 +964,9 @@ sub add_ruleset
   my $droplog_chain = $if->{ 'droplog chains' }->{ $opts->{ 'is output' } ? 'out' :'in' };
   my $table_default = $tables{ $current_table }->{ 'defaults' }->{ $opts->{ 'is output' } ? 'OUTPUT' : 'INPUT' };
 
-  if ( $addr ne '' && ! $opts->{ 'dedicated chain' } ) # non-dedicated chain: always need to specify address
+  if ( $cfg_addr ne '' && ! $opts->{ 'dedicated chain' } ) # non-dedicated chain: always need to specify address
   {
-    $src = '-s ' . $addr;
+    $src = '-s ' . $cfg_addr;
   }
 
   if( $debug )
@@ -964,17 +981,21 @@ sub add_ruleset
   {
     if ( $opts->{ 'dedicated chain' } )
     {
-      my $a = $addr;
-      if( $a !~ /^(\d+\.){3}\d+$/ ) # need to resolve first
+      if( $addr !~ /^(\d+\.){3}\d+$/ ) # need to resolve first
       {
-        $a = `/bin/ipcalc --no-decorate -o $a`;
-        chomp $a;
+        $addr = `/bin/ipcalc --no-decorate -o $addr`;
+        chomp $addr;
+
+        if( $addr !~ /^(\d+\.){3}\d+$/ ) # problems. falling back
+        {
+          $addr = $cfg_addr;
+        }
       }
 
       # finding net of client:
       for my $n ( 0..$#{ $if->{ 'ip4 net' } } ) # for each of interface nets
       {
-        my $s = $a . '/' . $if->{ 'ip4 mask' }->[ $n ];
+        my $s = $addr . '/' . $if->{ 'ip4 mask' }->[ $n ];
         $s = `/bin/ipcalc -b --no-decorate $s`;
         chomp $s;
 
@@ -984,7 +1005,7 @@ sub add_ruleset
           last;
         }
       }
-    }
+    } # $opts->{ 'dedicated chain' }
 
     # boot/dhcp is w/o IP yet. so be it first!
     my $noip = ''; # will be portlist
@@ -1011,7 +1032,7 @@ sub add_ruleset
     }
 
     # look monstrous huh? adding IP check for a host chain
-    if ( exists( $if->{ 'access' } ) && exists( $if->{ 'access' }->{ 'hosts' } ) && exists( $if->{ 'access' }->{ 'hosts' }->{ $addr } ) )
+    if ( exists( $if->{ 'access' } ) && exists( $if->{ 'access' }->{ 'hosts' } ) && exists( $if->{ 'access' }->{ 'hosts' }->{ $cfg_addr } ) )
     {
       addto ( $chain, '! -s', $addr, '-j', $if->{ 'name' } . $tables{ $current_table }->{ 'common chains' }->{ 'mismatched ip' } );
     }
@@ -1027,7 +1048,7 @@ sub add_ruleset
 
   if ( exists $rules->{ 'i-net' } and $default_if )
   {
-    $addr eq '' and croak "chain $chain: 'i-net' needs an address!";
+    $cfg_addr eq '' and croak "chain $chain: 'i-net' needs an address!";
 
     my $mode = $rules->{ 'i-net' }; # (c)lient/(s)erver/(b)oth
 

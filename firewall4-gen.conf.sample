@@ -2,6 +2,14 @@
 # This is perl code that will be included directly into generator.
 # So be paranoid
 
+# Only 'iptables' is supported right now.
+# Reserved for future use: 'routeros', 'firewalld'
+$output_mode = 'iptables';
+
+$save_file = '/etc/sysconfig/iptables.fwgen';
+# Use -t switch to produce test output to STDERR
+
+# settings for tables
 %tables = (
   'filter' => {
      # OK, basic scheme for filter is
@@ -355,6 +363,3 @@
   #'255.255.255.255/32',  # 255.255.255.255            Subnet  Reserved for the "limited broadcast" destination address.[1][11]
 );
 
-
-#$save_file = '/etc/sysconfig/iptables.fwgen';
-$save_file = 'iptables4-gen.test_output';
