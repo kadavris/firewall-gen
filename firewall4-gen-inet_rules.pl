@@ -1,4 +1,6 @@
-
+# Function: inet_rules( config_key )
+# Used to generate rules for internet-bound interface
+# Specifically more stiff and strict settings for incoming traffic
 ###############################################################################
 # in: name of the key in settings. used for multiple inet interfaces
 sub inet_rules

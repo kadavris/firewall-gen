@@ -14,6 +14,7 @@ our %net_interfaces; #main interfaces config
 our $save_file; # rules output file
 our @silent_drop_by_dst; # destinations to drop always
 our @cross_drop_list; # default destinations to drop between interfaces
+our @broadcast_nets;
 
 our %tables; # tables config
 our %classes; # access rules
@@ -859,14 +860,11 @@ sub add_proto_ports_rules
     }
 
     #-----------------------------
-    my @bc_list = ( '224.0.0.0/4', # 224.0.0.0 ~ 239.255.255.255 reserved for multicast addresses. RFC 3171
-                   '240.0.0.0/4', # reserved (former Class E network) RFC 1700
-                 );
     my @dst_ips;
 
     if ( $config_proto eq 'bcast' )
     {
-      @dst_ips = @bc_list;
+      @dst_ips = @broadcast_nets;
     }
 
     elsif( exists $opts->{ 'index' } ) # ruleset w defaults for a network - use specified destination ips
@@ -1028,6 +1026,14 @@ sub add_ruleset
       {
         addto( $chain, '-d 255.255.255.255 -p', $proto, '-m conntrack --ctstate NEW -m multiport --dports', $noip, '-j ACCEPT' );
         addto( $chain, '-s 169.254.0.0/16 -p', $proto, '-m conntrack --ctstate NEW -m multiport --dports', $noip, '-j ACCEPT' );
+      }
+    }
+
+    if( exists( $rules->{ 'bcast' } ) )
+    {
+      for my $bc_net ( @broadcast_nets )
+      {
+        addto( $chain, '-s 0.0.0.0 -d', $bc_net, '-j ACCEPT' );
       }
     }
 
@@ -1242,6 +1248,7 @@ sub add_access_rules
       $name or croak "!!! Host doesn't resolve: '$host' at " . $if->{ 'config name' } . "!!!";
 
       my $rules = get_class_access_rules( $host_list->{ $host }->[1] );
+
       my $ports_chain = $if->{ 'name' } . $common_chains->{ 'host prefix' } . $host;
 
       make_chain( $chain_in, $ports_chain, "Access class: '" . $host_list->{ $host }->[1] . "'" );
@@ -1773,5 +1780,8 @@ sub init
     'nat:PREROUTING' => [[]],
     'nat:POSTROUTING' => [[]],
   );
-}
 
+  @broadcast_nets = ( '224.0.0.0/4', # 224.0.0.0 ~ 239.255.255.255 reserved for multicast addresses. RFC 3171
+                  '240.0.0.0/4', # reserved (former Class E network) RFC 1700
+             );
+}
