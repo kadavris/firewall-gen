@@ -244,10 +244,12 @@ $save_file = '/etc/sysconfig/iptables.fwgen';
 
       'access' => {
          'hosts' => {
+           # you can add overlay/override configuration if you do not want to make new class for single device:
+           'some-notebook' =>   [ 'xx:xx:xx:xx:xx:xx', 'wifi known pc', 'tcp:some additional ports', 'some overrides here too' ... ],
+
            'server-to-wifi' =>  [ 'xx:xx:xx:xx:xx:xx', 'iface trusted' ], # own intf
            'somephone' =>       [ 'xx:xx:xx:xx:xx:xx', 'wifi known gadget' ],
            'some-tablet' =>     [ 'xx:xx:xx:xx:xx:xx', 'wifi known gadget' ],
-           'some-notebook' =>   [ 'xx:xx:xx:xx:xx:xx', 'wifi known pc' ],
            'vacuum' =>          [ 'xx:xx:xx:xx:xx:xx', 'wifi smarthome' ],
            'wifi-router' =>     [ 'xx:xx:xx:xx:xx:xx', 'net switch' ], # Access point itself
            'smartcam1' =>       [ 'xx:xx:xx:xx:xx:xx', 'wifi cam' ],

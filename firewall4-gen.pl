@@ -33,7 +33,7 @@ my $interface_default_options = {
 
 my $cfg = 'firewall4-gen.conf';
 
-my $version = '1.7';
+my $version = '1.71';
 
 ##########################################################
 # pull in service functions
@@ -390,7 +390,7 @@ sub make_rejects_chain
     {
       my ( $proto, $method ) = split( /:/, $key );
 
-      for my $ports ( @{ $if->{ 'incoming reject' }->{ $key } } )
+      for my $ports ( sort( num_cmp @{ $if->{ 'incoming reject' }->{ $key } } ) )
       {
         addto( $scans_chain, '-p', $proto, '-m multiport --dports', $ports, '-j REJECT --reject-with', $method );
       }
@@ -607,30 +607,14 @@ sub dup_app_rules
 }
 
 ##########################################################################################
-# builds a full list of access rules for a given class. replaces config records with pre-cached data
-# compiled rules array is [ undef, %hashref ] instead of original [ 'parent class', 'opt1', ... optN ]
-# hash contain globals as 'dhcp' => 1 and port-related as 'tcp'=>{someport=>1...} etc
-# parms: access record name, [nest level for recursive calls]
-# returns: access list hash ref
-sub get_class_access_rules
+# Overlays parent ruels (1st param) with child specifics (2nt param)
+# parms: <parent rules listref>, <override rules listref>, <tag name>
+# returns: none
+sub overlay_rules
 {
-  my $class = $_[0];
-  my $nest_level = $_[1] // 0;
-
-  exists( $classes{ $class } ) or croak "!!! Undefined class: '$class'";
-
-  my $parent = $classes{ $class }->[0];
-
-  defined( $parent ) or return $classes{ $class }->[1]; # already pre-compiled
-
-  $verboseness > 2 and print '  ' x $nest_level, ". Compiling class rules for ", ( $parent ne '' ? "'$parent'::" : 'root class ' ), "'$class'\n", '  ' x $nest_level;
-
-  croak "parent '$parent' of class '$class' does not exists!" if ( $parent ne '' && ! exists $classes{ $parent } );
-
-  my $rules = ( $parent eq '' ) ? {} : dclone( get_class_access_rules( $parent, $nest_level + 1 ) ); # pre-compile ancestry list if needed
-
-  my @config_rules = @{ $classes{ $class } };
-  shift @config_rules; # get rid of parent class name
+  my $rules = $_[0];
+  my $add_rules = $_[1];
+  my $tag_id = $_[2];
 
   # --- Init tree ---
   for my $proto ( qw~icmp tcp udp~ ) # create protocol lists if needed
@@ -639,11 +623,13 @@ sub get_class_access_rules
   }
   # --- Init tree end ---
 
-  foreach my $r ( @config_rules ) # getting parent's and own merged
+  $verboseness > 2 and print "\n. Overlay rules for $tag_id: ";
+
+  foreach my $r ( @{ $add_rules } ) # getting parent's and own merged
   {
     $verboseness > 2 and print "<$r>  ";
 
-    my $tag = 'class ' . $class . ', rule: ' . $r;
+    my $tag = $tag_id . ', rule: ' . $r;
 
     # easy add ones without parameters:
     if ( grep( /^$r$/, ( 'boot', 'dhcp', 'drop bad tcp', 'limit scans', 'log bad tcp', 'rtsp', 'samba', 'quarantine' )) )
@@ -697,7 +683,7 @@ sub get_class_access_rules
         $protocols = 'tcp,udp';
       }
 
-      $debug and print "\n!DBG: config: $r\n!DBG:\tparsed: $protocols : <", join('> <', @$portlist ), ">\n";
+      $debug and print "\n!DBG: config @ $tag: $r\n!DBG:\tparsed: $protocols : <", join('> <', @$portlist ), ">\n";
 
       for my $proto ( split( /,/, $protocols ) )
       {
@@ -754,7 +740,7 @@ sub get_class_access_rules
 
     next if $r eq ''; # maybe a product of some replacements
 
-    croak "!!! unknown access rule: '$r' !!!";
+    croak "!!! unknown access rule: '$r' @ $tag!!!";
   } # foreach my $r ( @config_rules ) # getting parent's and own merged
 
   # cleanup: get rid of port definitions that copy default
@@ -777,13 +763,54 @@ sub get_class_access_rules
       }
     }
   } # for proto
+} # sub overlay_rules
+
+##########################################################################################
+# builds a full list of access rules for a given class. replaces config records with pre-cached data
+# compiled rules array is [ undef, %hashref ] instead of original [ 'parent class', 'opt1', ... optN ]
+# hash contain globals as 'dhcp' => 1 and port-related as 'tcp'=>{someport=>1...} etc
+# parms: access record name[, <nest level for recursive calls>]
+# returns: access list hash ref
+sub get_class_access_rules
+{
+  my $class = $_[0];
+  my $nest_level = $_[1] // 0;
+
+  exists( $classes{ $class } ) or croak "!!! Undefined class: '$class'";
+
+  my $parent = $classes{ $class }->[0];
+
+  if ( ! defined( $parent ) ) # undef if already compiled
+  {
+    return $classes{ $class }->[1];
+  }
+
+  my $tag = ( $parent ne '' ? "'$parent'::" : 'root class ' ) . "'" . $class . "'";
+  $verboseness > 2 and print "\n. ", '  ' x $nest_level, "Compiling class rules for ", $tag, "\n", '  ' x $nest_level;
+
+  if ( $parent ne '' && ! exists $classes{ $parent } )
+  {
+    croak "parent '$parent' of class '$class' does not exists!" 
+  }
+
+  my $rules = {};
+
+  if ( $parent ne '' ) # this one is based on other class - getting parent config
+  {
+    $rules = dclone( get_class_access_rules( $parent, $nest_level + 1 ) ); # pre-compile ancestry list if needed
+  }
+
+  my @config_rules = @{ $classes{ $class } };
+  shift @config_rules; # get rid of parent class name
+
+  overlay_rules( $rules, \@config_rules, $tag ); # mix our rules onto parent's
 
   $verboseness > 2 and print "\n", ( $nest_level > 0 ? '  ' x ( $nest_level - 1 ) : '' ) ;
 
   $classes{ $class } = [ undef, $rules ];
 
   return $rules;
-} # sub get_class_access_rules
+}
 
 ###############################################################################
 sub port_sanity_check
@@ -891,7 +918,7 @@ sub add_proto_ports_rules
       {
         next if $#$port_set == -1; # there are no ports in config really, but there may be default left, so we continue
 
-        my $port = $#{ $port_set } == 0 ? '--dport ' . $port_set->[ 0 ] : '-m multiport --dports ' . join( ',', @$port_set );
+        my $port = $#{ $port_set } == 0 ? '--dport ' . $port_set->[ 0 ] : '-m multiport --dports ' . join( ',', sort( num_cmp @$port_set ) );
 
         if ( $real_proto eq 'icmp' )
         {
@@ -1247,11 +1274,20 @@ sub add_access_rules
       my ( $name, $aliases, $addrtype, $length, @addrs ) = gethostbyname( $host );
       $name or croak "!!! Host doesn't resolve: '$host' at " . $if->{ 'config name' } . "!!!";
 
-      my $rules = get_class_access_rules( $host_list->{ $host }->[1] );
+      my $host_data = $host_list->{ $host };
+
+      # host definition record: MAC, 'class'[, <rule>...]
+      my $rules = get_class_access_rules( $host_data->[1] );
+
+      if ( $#{ $host_data } > 1 )
+      {
+        my @host_rules = @{ $host_data }[ 2..$#{ $host_data } ];
+        overlay_rules( $rules, \@host_rules, 'host ' . $name );
+      }
 
       my $ports_chain = $if->{ 'name' } . $common_chains->{ 'host prefix' } . $host;
 
-      make_chain( $chain_in, $ports_chain, "Access class: '" . $host_list->{ $host }->[1] . "'" );
+      make_chain( $chain_in, $ports_chain, "Access class: '" . $host_data->[1] . "'" . ( $#$host_data > 2 ? ' (with overlay rules)' : '' ) );
 
       addto( $chain_in, '-m mac --mac-source', $acc->{ 'hosts' }->{ $host }->[0], '-j', $ports_chain );
 
@@ -1304,7 +1340,7 @@ sub add_access_rules
 
       if ( exists( $r->{ 'logdrop' } ) )
       {
-        log_it( $chain, '', 'DROP', '-p tcp -m limit --limit 10/m -m multiport --dports ', join(',' , @{ $r->{ 'logdrop' } } ) );
+        log_it( $chain, '', 'DROP', '-p tcp -m limit --limit 10/m -m multiport --dports ', join(',', sort( num_cmp @{ $r->{ 'logdrop' } } ) ) );
         log_it( $chain, '', 'DROP', '-p icmp -m limit --limit 1/m' );
       }
 
@@ -1763,6 +1799,13 @@ sub check_args_not_empty
   {
     carp "\tErrs: $errs, warns: $warns\n\t$func( $s> )\n";
   }
+}
+
+##########################################################################################
+# For sorting: compares two args numerically
+sub num_cmp
+{
+  return ( 0 + $a ) <=> ( 0 + $b );
 }
 
 ##########################################################################################
