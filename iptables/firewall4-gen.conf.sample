@@ -136,6 +136,14 @@ $save_file = '/etc/sysconfig/iptables.fwgen';
 #     ipX default class - default for unlisted network clients to access this interface
 #     ipX interface class - interface's own class. Used mainly for outgoing-quarantined virtual containers, etc...
 
+# crossnet is handy when you want to allow incoming from the different network that your interface's own.
+# The firewall setup will not block it within spoofing chain then.
+# In home network setup it will be when you want local web service to be accessible from your phone on wi-fi,
+# but your server is connected to the router on separate network.
+# 'crossnet' is an array of arrays:
+# [ '<filter on>', '<filter-specific configuration item(s)>', 'network to pass through' ],
+# Currently <filter on> can be 'MAC' only, the second element is the router's MAC address that will forward packets.
+
 # 'access' sub-tree format:
 #    'host/ip' => [ 'mac', 'allowed tcp ports list', 'allowed udp ports list', 'allowed icmp ports list' ]
 #    '+' in ports list means no restrictions to any internal address, '*' - relaxed only to server's if, '-'|'' - drop all
@@ -154,6 +162,9 @@ $save_file = '/etc/sysconfig/iptables.fwgen';
       'ip4 net'      => [ '10.1.1.0/24', '10.90.90.0/24' ],
       'ip4 default class'   => [ 'net trusted', 'net un-trusted' ],
       'ip4 interface class' => [ 'iface trusted', 'iface trusted' ],
+      'crossnet' => [
+          [ 'MAC', 'xx:xx:xx:xx:xx:xx', '192.168.1.0/24' ],
+      ],
       'access' => {
            'hosts' => {
                'dlink-switch' => [ 'xx:xx:xx:xx:xx:xx', 'net switch' ],

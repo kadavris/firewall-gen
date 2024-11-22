@@ -256,7 +256,7 @@ sub generic_physical_rules
     for my $n ( @{ $if->{ 'silent drop list' } } )
     {
       add_hostport_to( $chain, '-d', $n, '-j DROP' );
-    } 
+    }
 
   make_rejects_chain( $if );
   make_special_rules( $if );
@@ -1231,6 +1231,21 @@ sub add_access_rules
       addto( $chain, '-s', $elem, '-j RETURN' ); # good
     }
 
+    if ( defined( $if->{ 'crossnet' } ) )
+    {
+      for my $xnetrec ( @{$if->{ 'crossnet' }} )
+      {
+        # [ 'MAC', $MAC{ 'lan_mikrotik' }, '192.168.1.0/16' ],
+        if ( $xnetrec->[0] eq 'MAC' )
+        {
+          for my $xneti ( 2..$#$xnetrec )
+          {
+            addto( $chain, '-s', $xnetrec->[$xneti], '-m mac --mac-source', $xnetrec->[1], '-j RETURN' ); # also good
+          }
+        }
+      }
+    }
+
     for my $proto ( qw~tcp udp~ ) # DHCP/BOOTP. let it be relaxed about tcp/udp specifics for now
     {
       my $ports='bootps,bootpc,dhcp-failover,dhcp-failover2,dhcpv6-client';
@@ -1289,7 +1304,14 @@ sub add_access_rules
 
       make_chain( $chain_in, $ports_chain, "Access class: '" . $host_data->[1] . "'" . ( $#$host_data > 2 ? ' (with overlay rules)' : '' ) );
 
-      addto( $chain_in, '-m mac --mac-source', $acc->{ 'hosts' }->{ $host }->[0], '-j', $ports_chain );
+      if ( $acc->{ 'hosts' }->{ $host }->[0] eq '' ) # no MAC: cross-net access
+      {
+        addto( $chain_in, '-s', $host, '-j', $ports_chain );
+      }
+      else
+      {
+        addto( $chain_in, '-m mac --mac-source', $acc->{ 'hosts' }->{ $host }->[0], '-j', $ports_chain );
+      }
 
       add_ruleset( $if, $rules, $ports_chain, $host, { 'dedicated chain' => 1, 'is output' => 0 } );
     } # for my $host
