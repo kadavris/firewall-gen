@@ -984,7 +984,7 @@ sub add_ruleset
 
 
   my $src = ''; # for a host chain we skip using -s addr
-  my $same_net; # netmask. used for enabling specific client's broadcasts like for samba
+  my $bcast_net; # netmask. used for enabling specific client's broadcasts like for samba
 
   my $droplog_chain = $if->{ 'droplog chains' }->{ $opts->{ 'is output' } ? 'out' :'in' };
   my $table_default = $tables{ $current_table }->{ 'defaults' }->{ $opts->{ 'is output' } ? 'OUTPUT' : 'INPUT' };
@@ -1017,7 +1017,7 @@ sub add_ruleset
         }
       }
 
-      # finding net of client:
+      # finding the net of this client:
       for my $n ( 0..$#{ $if->{ 'ip4 net' } } ) # for each of interface nets
       {
         my $s = $addr . '/' . $if->{ 'ip4 mask' }->[ $n ];
@@ -1026,9 +1026,14 @@ sub add_ruleset
 
         if ( $if->{ 'ip4 bcast' }->[ $n ] eq $s )
         {
-          $same_net = $if->{ 'ip4 net' }->[ $n ];
+          $bcast_net = $if->{ 'ip4 net' }->[ $n ];
           last;
         }
+      }
+
+      if ( ! defined( $bcast_net ) ) # set to default. We need this for wifi->router->lan incoming
+      {
+        $bcast_net = $if->{ 'ip4 net' }->[ 0 ];
       }
     } # $opts->{ 'dedicated chain' }
 
@@ -1070,10 +1075,10 @@ sub add_ruleset
       addto ( $chain, '! -s', $addr, '-j', $if->{ 'name' } . $tables{ $current_table }->{ 'common chains' }->{ 'mismatched ip' } );
     }
 
-    if ( exists $rules->{ 'samba' } && defined( $same_net ) ) # we need this to enable not only direct access, but a little broadcast too
+    if ( exists $rules->{ 'samba' } && defined( $bcast_net ) ) # we need this to enable not only direct access, but a little broadcast too
     {
-      addto( $chain, $src, '-p tcp -d', $same_net, '-m multiport --dports 137:139,445 -j ACCEPT' ); # same net
-      addto( $chain, $src, '-p udp -d', $same_net, '-m multiport --dports 137:139,445 -j ACCEPT' ); # same net
+      addto( $chain, $src, '-p tcp -d', $bcast_net, '-m multiport --dports 137:139,445 -j ACCEPT' ); # same net
+      addto( $chain, $src, '-p udp -d', $bcast_net, '-m multiport --dports 137:139,445 -j ACCEPT' ); # same net
     }
   } # if input
 
