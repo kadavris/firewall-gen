@@ -123,9 +123,18 @@ addto( 'INPUT', '-i lo -j ACCEPT' ); # allmighty 127.0.0.1
 
 for my $ch ( qw( INPUT OUTPUT FORWARD ) )
 {
-  make_log_chains( $ch, 'b');
-  log_it( $ch, 'INV', 'DROP', '-m conntrack --ctstate INVALID' );
-  addto( $ch, '-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' );
+    make_log_chains( $ch, 'b');
+
+    if ( $ch eq 'OUTPUT' )
+    {
+        addto( $ch, '-m conntrack --ctstate INVALID -j DROP' );
+    }
+    else
+    {
+        log_it( $ch, 'INV', 'DROP', '-m conntrack --ctstate INVALID' );
+    }
+
+    addto( $ch, '-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' );
 }
 
 ##################################
@@ -991,7 +1000,7 @@ sub add_ruleset
 
   if ( $cfg_addr ne '' && ! $opts->{ 'dedicated chain' } ) # non-dedicated chain: always need to specify address
   {
-    $src = '-s ' . $cfg_addr;
+      $src = '-s ' . $cfg_addr;
   }
 
   if( $debug )
@@ -1172,7 +1181,7 @@ sub add_ruleset
 
   if ( exists $rules->{ 'allowfrom' } ) # $rules->{ 'allowfrom' }->{ from addr }->{ proto }->{ local port }
   {
-    dup_app_rules( $rules->{ 'allowfrom' }, $if->{ 'chains' }->{ 'in' }, '-s %1 -p %2 --dport %3 -j ACCEPT' );
+      dup_app_rules( $rules->{ 'allowfrom' }, $if->{ 'chains' }->{ 'in' }, '-s %1 -p %2 --dport %3 -j ACCEPT' );
   }
 
   if ( exists $rules->{ 'logdrop' } ) # this should be the last
@@ -1214,6 +1223,32 @@ sub add_ruleset
 } # add_ruleset()
 
 ###############################################################################
+# parms: 
+#     interface config hash ref
+#     chain name
+#     MAC to filter on, or empty to complete all what is left
+# return: none
+sub add_crossnet_records
+{
+    my ($if, $chain, $mac) = @_;
+
+    return if ! defined( $if->{ 'crossnet' } );
+
+    for my $xnetrec ( @{$if->{ 'crossnet' }} )
+    {
+        # [ 'MAC', $MAC{ 'lan_mikrotik' }, '192.168.1.0/16' ],
+        if ( $xnetrec->[0] eq 'MAC' && lc($xnetrec->[1]) eq lc($mac) )
+        {
+            for my $xneti ( 2..$#$xnetrec )
+            {
+                addto( $chain, '-s', $xnetrec->[$xneti], '-j RETURN' ); # also good
+            }
+        }
+    }
+}
+
+
+###############################################################################
 # parms: interface config hash ref
 # return: none
 sub add_access_rules
@@ -1236,20 +1271,7 @@ sub add_access_rules
       addto( $chain, '-s', $elem, '-j RETURN' ); # good
     }
 
-    if ( defined( $if->{ 'crossnet' } ) )
-    {
-      for my $xnetrec ( @{$if->{ 'crossnet' }} )
-      {
-        # [ 'MAC', $MAC{ 'lan_mikrotik' }, '192.168.1.0/16' ],
-        if ( $xnetrec->[0] eq 'MAC' )
-        {
-          for my $xneti ( 2..$#$xnetrec )
-          {
-            addto( $chain, '-s', $xnetrec->[$xneti], '-m mac --mac-source', $xnetrec->[1], '-j RETURN' ); # also good
-          }
-        }
-      }
-    }
+    add_crossnet_records( $if, $chain, '' );
 
     for my $proto ( qw~tcp udp~ ) # DHCP/BOOTP. let it be relaxed about tcp/udp specifics for now
     {
@@ -1279,16 +1301,16 @@ sub add_access_rules
     for my $host ( sort( keys %{ $host_list } ) )
     {
       my $client = { # initialize additional host info for subsequent function calls
-        'name' => $host, # main name by which it will be called in script
-        #'match_ic' => [ 'clients address #1,address2', ...], # this will match interface's net on order to client's addresses
-        #'match_ci' => { 'clients address #1' => interface's "ip4*" index, ... }
-        'd2i' => {},   # domain -> ip
-        'i2d' => {},   # reverse: ip -> domain
-        'all_nets' => {},   # network specifications for each domain and ip
-        'all_masks' => {},  # mask for each domain and ip
-        'all_bcasts' => {}, # broadcast address for each domain and ip
-        #'rules' => {}, # rules. assigned later
-        #'' => {}, # 
+          'name' => $host, # main name by which it will be called in script
+          #'match_ic' => [ 'clients address #1,address2', ...], # this will match interface's net on order to client's addresses
+          #'match_ci' => { 'clients address #1' => interface's "ip4*" index, ... }
+          'd2i' => {},   # domain -> ip
+          'i2d' => {},   # reverse: ip -> domain
+          'all_nets' => {},   # network specifications for each domain and ip
+          'all_masks' => {},  # mask for each domain and ip
+          'all_bcasts' => {}, # broadcast address for each domain and ip
+          #'rules' => {}, # rules. assigned later
+          #'' => {}, # 
       };
 
       my ( $name, $aliases, $addrtype, $length, @addrs ) = gethostbyname( $host );
@@ -1301,8 +1323,8 @@ sub add_access_rules
 
       if ( $#{ $host_data } > 1 )
       {
-        my @host_rules = @{ $host_data }[ 2..$#{ $host_data } ];
-        overlay_rules( $rules, \@host_rules, 'host ' . $name );
+          my @host_rules = @{ $host_data }[ 2..$#{ $host_data } ];
+          overlay_rules( $rules, \@host_rules, 'host ' . $name );
       }
 
       my $ports_chain = $if->{ 'name' } . $common_chains->{ 'host prefix' } . $host;
@@ -1311,11 +1333,12 @@ sub add_access_rules
 
       if ( $acc->{ 'hosts' }->{ $host }->[0] eq '' ) # no MAC: cross-net access
       {
-        addto( $chain_in, '-s', $host, '-j', $ports_chain );
+          addto( $chain_in, '-s', $host, '-j', $ports_chain );
       }
       else
       {
-        addto( $chain_in, '-m mac --mac-source', $acc->{ 'hosts' }->{ $host }->[0], '-j', $ports_chain );
+          addto( $chain_in, '-m mac --mac-source', $acc->{ 'hosts' }->{ $host }->[0], '-j', $ports_chain );
+          add_crossnet_records( $if, $ports_chain, $acc->{ 'hosts' }->{ $host }->[0] );
       }
 
       add_ruleset( $if, $rules, $ports_chain, $host, { 'dedicated chain' => 1, 'is output' => 0 } );
