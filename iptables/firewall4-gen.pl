@@ -1236,10 +1236,10 @@ sub add_crossnet_records
 
     for my $xnetrec ( @{$if->{ 'crossnet' }} )
     {
-        # [ 'MAC', $MAC{ 'lan_mikrotik' }, '192.168.1.0/16' ],
-        if ( $xnetrec->[0] eq 'MAC' && lc($xnetrec->[1]) eq lc($mac) )
+        # [ 'SPOOF', 'net1'... ],
+        if ( $mac eq '' && $xnetrec->[0] eq 'SPOOF' )
         {
-            for my $xneti ( 2..$#$xnetrec )
+            for my $xneti ( 1..$#$xnetrec )
             {
                 addto( $chain, '-s', $xnetrec->[$xneti], '-j RETURN' ); # also good
             }
@@ -1247,6 +1247,79 @@ sub add_crossnet_records
     }
 }
 
+
+###############################################################################
+# parms:
+#     interface config hash ref
+#     host name
+#     host's data array ref
+# return: none
+sub add_host_rules
+{
+      my ($if, $host, $host_data) = @_;
+      my $chain_in = $if->{ 'chains' }->{ 'in' };
+
+      #my $client = { # initialize additional host info for subsequent function calls
+      #    'name' => $host, # main name by which it will be called in script
+      #    #'match_ic' => [ 'clients address #1,address2', ...], # this will match interface's net on order to client's addresses
+      #    #'match_ci' => { 'clients address #1' => interface's "ip4*" index, ... }
+      #    'd2i' => {},   # domain -> ip
+      #    'i2d' => {},   # reverse: ip -> domain
+      #    'all_nets' => {},   # network specifications for each domain and ip
+      #    'all_masks' => {},  # mask for each domain and ip
+      #    'all_bcasts' => {}, # broadcast address for each domain and ip
+      #    #'rules' => {}, # rules. assigned later
+      #    #'' => {}, # 
+      #};
+
+      my ( $name, $aliases, $addrtype, $length, @addrs ) = gethostbyname( $host );
+      $name or croak "!!! Host doesn't resolve: '$host' at " . $if->{ 'config name' } . "!!!";
+
+      # host definition record: MAC, 'class'[, <rule>...]
+      my $rules = get_class_access_rules( $host_data->[1] );
+
+      if ( $#{ $host_data } > 1 )
+      {
+          my @host_rules = @{ $host_data }[ 2..$#{ $host_data } ];
+          overlay_rules( $rules, \@host_rules, 'host ' . $name );
+      }
+
+      my $ports_chain = $if->{ 'name' } . $common_chains->{ 'host prefix' } . $host;
+
+      make_chain( $chain_in, $ports_chain, "Access class: '" . $host_data->[1] . "'" . ( $#$host_data > 2 ? ' (with overlay rules)' : '' ) );
+
+      if ( $host_data->[0] eq '' ) # no MAC: cross-net access
+      {
+          $if->{ 'xn_hosts' }->{ $host } = [ inet_ntoa($addrs[0]) ];  # add for the actual chain jump later
+      }
+      else
+      {
+          addto( $chain_in, '-m mac --mac-source', $host_data->[0], '-j', $ports_chain );
+          if ( exists($if->{ 'crossnet' }) )
+          {
+              for my $xnetrec ( @{$if->{ 'crossnet' }} )
+              {
+                  # [ 'MAC', $MAC{ 'lan_mikrotik' }, '192.168.1.0/16' ],
+                  if ( $xnetrec->[0] eq 'MAC' && lc($xnetrec->[1]) eq lc($host_data->[0]) )
+                  {
+                      # that's me!
+                      for my $xhost_name ( keys %{$if->{ 'xn_hosts' }} )
+                      {
+                          my $xhostrec = $if->{ 'xn_hosts' }->{ $xhost_name };
+                          if ( is_addr_in_net($xhostrec->[0], $xnetrec->[2]) )
+                          {
+                              addto( $ports_chain, '-s', $xhostrec->[0], '-j', $if->{ 'name' } . $common_chains->{ 'host prefix' } . $xhost_name );
+                              delete $if->{ 'xn_hosts' }->{ $xhost_name };
+                          }
+                      }
+                      last;
+                  }
+              }
+          }  #if ( exists($if->{ 'crossnet' }) )
+      }  # has MAC defined
+
+      add_ruleset( $if, $rules, $ports_chain, $host, { 'dedicated chain' => 1, 'is output' => 0 } );
+}
 
 ###############################################################################
 # parms: interface config hash ref
@@ -1262,26 +1335,29 @@ sub add_access_rules
   # making antispoof chain
   my @nets = @{ $if->{ 'ip4 net' } };
   my $chain = $ifalias . '_spoof_check';
+  $if->{ 'xn_hosts' } = {};  # cross-net hosts enumerated: 'name' => ['addr']
 
+  # anti-spoof section
   make_chain( $chain_in, $chain );
     addto( $chain_in, '-j', $chain );
 
     for my $elem ( @nets )
     {
-      addto( $chain, '-s', $elem, '-j RETURN' ); # good
+        addto( $chain, '-s', $elem, '-j RETURN' ); # good
     }
 
     add_crossnet_records( $if, $chain, '' );
 
     for my $proto ( qw~tcp udp~ ) # DHCP/BOOTP. let it be relaxed about tcp/udp specifics for now
     {
-      my $ports='bootps,bootpc,dhcp-failover,dhcp-failover2,dhcpv6-client';
-      addto( $chain, '-d 255.255.255.255 -p', $proto, '-m conntrack --ctstate NEW -m multiport --dports', $ports, '-j RETURN' );
-      addto( $chain, '-s 169.254.0.0/16 -p', $proto, '-m conntrack --ctstate NEW -m multiport --dports', $ports, '-j RETURN' );
+        my $ports='bootps,bootpc,dhcp-failover,dhcp-failover2,dhcpv6-client';
+        addto( $chain, '-d 255.255.255.255 -p', $proto, '-m conntrack --ctstate NEW -m multiport --dports', $ports, '-j RETURN' );
+        addto( $chain, '-s 169.254.0.0/16 -p', $proto, '-m conntrack --ctstate NEW -m multiport --dports', $ports, '-j RETURN' );
     }
     addto( $chain, '-s 0.0.0.0 -j RETURN' ); # dhcp pre-pass. if it is disabled it will be dropped later
 
     addto( $chain, '-j', $if->{ 'droplog chains' }->{ 'in' } ); # bad
+  # END: anti-spoof section
 
 
   my $host_list = defined( $acc->{ 'hosts' } ) ? $acc->{ 'hosts' } : undef;
@@ -1291,59 +1367,37 @@ sub add_access_rules
   # unknowns processed later
   if ( $host_list ) # we have per-host rules there
   {
-    my $mism_ip_chain = $ifalias . $common_chains->{ 'mismatched ip' };
-    make_chain( $chain_in, $mism_ip_chain );
-      addto( $mism_ip_chain, '-j LOG --log-level info --log-prefix', '"ipt4-' . $ifalias . ' MAC+,IP- " ' );
-      addto( $mism_ip_chain, '-j DROP' );
+      my $mism_ip_chain = $ifalias . $common_chains->{ 'mismatched ip' };
+      make_chain( $chain_in, $mism_ip_chain );
+        addto( $mism_ip_chain, '-j LOG --log-level info --log-prefix', '"ipt4-' . $ifalias . ' MAC+,IP- " ' );
+        addto( $mism_ip_chain, '-j DROP' );
 
-    # HOSTS:
-    # adding individual host's rules. make it diff-friendly sorted
-    for my $host ( sort( keys %{ $host_list } ) )
-    {
-      my $client = { # initialize additional host info for subsequent function calls
-          'name' => $host, # main name by which it will be called in script
-          #'match_ic' => [ 'clients address #1,address2', ...], # this will match interface's net on order to client's addresses
-          #'match_ci' => { 'clients address #1' => interface's "ip4*" index, ... }
-          'd2i' => {},   # domain -> ip
-          'i2d' => {},   # reverse: ip -> domain
-          'all_nets' => {},   # network specifications for each domain and ip
-          'all_masks' => {},  # mask for each domain and ip
-          'all_bcasts' => {}, # broadcast address for each domain and ip
-          #'rules' => {}, # rules. assigned later
-          #'' => {}, # 
-      };
-
-      my ( $name, $aliases, $addrtype, $length, @addrs ) = gethostbyname( $host );
-      $name or croak "!!! Host doesn't resolve: '$host' at " . $if->{ 'config name' } . "!!!";
-
-      my $host_data = $host_list->{ $host };
-
-      # host definition record: MAC, 'class'[, <rule>...]
-      my $rules = get_class_access_rules( $host_data->[1] );
-
-      if ( $#{ $host_data } > 1 )
+      # HOSTS:
+      # adding individual host's rules. make it diff-friendly sorted
+      # but 1st we add cross-net ones without macs
+      for my $host ( sort( keys %{ $host_list } ) )
       {
-          my @host_rules = @{ $host_data }[ 2..$#{ $host_data } ];
-          overlay_rules( $rules, \@host_rules, 'host ' . $name );
+          my $host_data = $host_list->{ $host };
+          next if $host_data->[0] ne '';
+
+          add_host_rules( $if, $host, $host_data );
       }
 
-      my $ports_chain = $if->{ 'name' } . $common_chains->{ 'host prefix' } . $host;
-
-      make_chain( $chain_in, $ports_chain, "Access class: '" . $host_data->[1] . "'" . ( $#$host_data > 2 ? ' (with overlay rules)' : '' ) );
-
-      if ( $acc->{ 'hosts' }->{ $host }->[0] eq '' ) # no MAC: cross-net access
+      for my $host ( sort( keys %{ $host_list } ) )
       {
-          addto( $chain_in, '-s', $host, '-j', $ports_chain );
+          my $host_data = $host_list->{ $host };
+          next if $host_data->[0] eq '';
+          add_host_rules( $if, $host, $host_data );
       }
-      else
-      {
-          addto( $chain_in, '-m mac --mac-source', $acc->{ 'hosts' }->{ $host }->[0], '-j', $ports_chain );
-          add_crossnet_records( $if, $ports_chain, $acc->{ 'hosts' }->{ $host }->[0] );
-      }
-
-      add_ruleset( $if, $rules, $ports_chain, $host, { 'dedicated chain' => 1, 'is output' => 0 } );
-    } # for my $host
   } # if $host_list
+
+  my $xn_dangling = '';
+  for my $xhost_name ( keys %{$if->{ 'xn_hosts' }} )
+  {
+     $xn_dangling .= ' ' . $xhost_name;
+  }
+
+  $xn_dangling ne '' and croak "!!! Dangling cross-net hosts: '$xn_dangling' at " . $if->{ 'config name' } . "!!!";
 
   # and defaults
   for my $i ( 0..$#{ $if->{ 'ip4 net' } } ) # for each of interface nets

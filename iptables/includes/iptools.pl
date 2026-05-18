@@ -133,10 +133,10 @@ sub is_addr_in_net
   validate_ip4( $_[0] );
   validate_ip4( $_[1] );
 
-  my @a1 = get_net_range( $_[0] );
-  my @a2 = get_net_range( $_[1] );
+  my @host = get_net_range( $_[0] );
+  my @net = get_net_range( $_[1] );
 
-  return ( $a1[ 0 ] >= $a2[ 1 ] && $a1[ 1 ] <= $a2[ 1 ] );
+  return ( $host[0] >= $net[0] && $host[1] <= $net[1] );
 }
 
 ##########################################################################################
